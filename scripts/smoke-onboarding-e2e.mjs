@@ -138,9 +138,33 @@ async function fetchJson(url, options = {}, cookies = []) {
   });
 
   const setCookie = response.headers.get("set-cookie");
+  const contentType = response.headers.get("content-type") || "";
   const nextCookies = parseSetCookie(setCookie);
   const text = await response.text();
   let data;
+  let streamEvents = [];
+  let streamError = null;
+
+  if (contentType.includes("application/x-ndjson")) {
+    streamEvents = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+
+    const errorEvent = streamEvents.find((event) => event?.type === "error");
+    const completedEvent = [...streamEvents].reverse().find((event) => event?.type === "completed");
+    streamError = errorEvent?.error ?? null;
+    data = completedEvent?.payload ?? (streamError ? { error: streamError } : null);
+
+    return {
+      status: response.status,
+      data,
+      cookies: nextCookies,
+      streamEvents,
+      streamError,
+    };
+  }
 
   try {
     data = text ? JSON.parse(text) : null;
@@ -152,6 +176,8 @@ async function fetchJson(url, options = {}, cookies = []) {
     status: response.status,
     data,
     cookies: nextCookies,
+    streamEvents,
+    streamError,
   };
 }
 
@@ -172,6 +198,10 @@ async function readJsonBody(request) {
 function assertOk(response, label) {
   if (response.status >= 400) {
     throw new Error(`${label} failed: ${JSON.stringify(response.data)}`);
+  }
+
+  if (response.streamError) {
+    throw new Error(`${label} failed: ${JSON.stringify(response.streamError)}`);
   }
 }
 
@@ -322,6 +352,72 @@ function buildResponseApiPayload(body, requestIndex) {
   };
 }
 
+function splitStreamOutput(output) {
+  if (output.length <= 24) {
+    return [output];
+  }
+
+  const midpoint = Math.max(1, Math.floor(output.length / 2));
+  return [output.slice(0, midpoint), output.slice(midpoint)];
+}
+
+function writeSseEvent(response, payload) {
+  response.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function writeResponseApiStream(response, body, requestIndex) {
+  const model = typeof body?.model === "string" ? body.model : "gpt-4o-mini";
+  const output = buildTaskOutput(detectTaskKind(body), body);
+  const responseId = `resp_${requestIndex}`;
+  const itemId = `msg_${requestIndex}`;
+  const createdAt = Math.floor(Date.now() / 1000);
+
+  response.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+  });
+
+  writeSseEvent(response, {
+    type: "response.created",
+    response: {
+      id: responseId,
+      created_at: createdAt,
+      model,
+      service_tier: null,
+    },
+  });
+
+  for (const chunk of splitStreamOutput(output)) {
+    writeSseEvent(response, {
+      type: "response.output_text.delta",
+      item_id: itemId,
+      delta: chunk,
+      logprobs: null,
+    });
+  }
+
+  writeSseEvent(response, {
+    type: "response.completed",
+    response: {
+      incomplete_details: null,
+      usage: {
+        input_tokens: 48,
+        input_tokens_details: {
+          cached_tokens: 0,
+        },
+        output_tokens: 36,
+        output_tokens_details: {
+          reasoning_tokens: 0,
+        },
+      },
+      service_tier: null,
+    },
+  });
+  response.write("data: [DONE]\n\n");
+  response.end();
+}
+
 function buildChatCompletionPayload(body, requestIndex) {
   const model = typeof body?.model === "string" ? body.model : "gpt-4o-mini";
   const output = buildTaskOutput(detectTaskKind(body), body);
@@ -364,6 +460,11 @@ function createMockProviderServer(state) {
     const requestIndex = state.requestBodies.length;
 
     if (url.pathname === "/v1/responses") {
+      if (body?.stream) {
+        writeResponseApiStream(response, body, requestIndex);
+        return;
+      }
+
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(buildResponseApiPayload(body, requestIndex)));
       return;
@@ -641,6 +742,11 @@ async function main() {
       aiSessionCreate.data.session.currentQuestion?.source === "ai",
       "AI onboarding session did not expose an AI current question.",
     );
+    assert(
+      !aiSessionCreate.streamEvents.length ||
+        aiSessionCreate.streamEvents.some((event) => event.type === "text-delta"),
+      "AI onboarding session stream did not return any text delta.",
+    );
 
     let aiSession = aiSessionCreate.data.session;
 
@@ -664,6 +770,10 @@ async function main() {
         cookies,
       );
       assertOk(aiAnswerResponse, `answer AI onboarding question ${questionKey}`);
+      assert(
+        !aiAnswerResponse.streamEvents.length || aiAnswerResponse.streamEvents.some((event) => event.type === "text-delta"),
+        `AI onboarding answer stream for ${questionKey} did not return any text delta.`,
+      );
       aiSession = aiAnswerResponse.data.session;
     }
 
@@ -791,8 +901,10 @@ async function main() {
       cookies,
     );
     assertOk(markdownReference, "blank onboarding markdown reference upload");
+    const markdownReferenceItem = markdownReference.data.items?.[0];
+    assert(markdownReferenceItem, "blank onboarding markdown reference upload did not return an item.");
     assert(
-      markdownReference.data.normalizedText?.includes(blankMarkdownMarker),
+      markdownReferenceItem.normalizedText?.includes(blankMarkdownMarker),
       "blank markdown reference did not keep the readable text.",
     );
 
@@ -828,14 +940,16 @@ async function main() {
       cookies,
     );
     assertOk(htmlReference, "blank onboarding html reference upload");
+    const htmlReferenceItem = htmlReference.data.items?.[0];
+    assert(htmlReferenceItem, "blank onboarding html reference upload did not return an item.");
     assert(
-      typeof htmlReference.data.normalizedText === "string" &&
-        htmlReference.data.normalizedText.includes(blankHtmlMarker) &&
-        htmlReference.data.normalizedText.includes(blankHtmlOneboxMarker),
+      typeof htmlReferenceItem.normalizedText === "string" &&
+        htmlReferenceItem.normalizedText.includes(blankHtmlMarker) &&
+        htmlReferenceItem.normalizedText.includes(blankHtmlOneboxMarker),
       "blank html reference did not keep the visible readable text.",
     );
     assert(
-      !htmlReference.data.normalizedText.includes(blankScriptNoiseMarker),
+      !htmlReferenceItem.normalizedText.includes(blankScriptNoiseMarker),
       "blank html reference still contained stripped script noise.",
     );
 
@@ -851,7 +965,7 @@ async function main() {
           endpointId: endpoint.data.id,
           modelId: "gpt-4o-mini",
           selectedArtifactIds: [],
-          selectedReferenceIds: [markdownReference.data.id, htmlReference.data.id],
+          selectedReferenceIds: [markdownReferenceItem.id, htmlReferenceItem.id],
           selectedMcpServerIds: [],
           generationOptions: {
             temperature: 0,
@@ -908,8 +1022,8 @@ async function main() {
     assert(blankRun.status === "succeeded", `blank onboarding digest run status was ${blankRun.status}`);
     assert(
       Array.isArray(blankRun.selectedReferenceIds) &&
-        blankRun.selectedReferenceIds.includes(markdownReference.data.id) &&
-        blankRun.selectedReferenceIds.includes(htmlReference.data.id),
+        blankRun.selectedReferenceIds.includes(markdownReferenceItem.id) &&
+        blankRun.selectedReferenceIds.includes(htmlReferenceItem.id),
       "blank onboarding digest run did not persist the selected reference ids.",
     );
     assert(
@@ -945,7 +1059,7 @@ async function main() {
           digestDraftId: blankDigestDraft.id,
           digestOutput: blankDigestGenerate.data.output,
           authorNotes: blankAuthorNotes,
-          importedReferenceIds: [markdownReference.data.id, htmlReference.data.id],
+          importedReferenceIds: [markdownReferenceItem.id, htmlReferenceItem.id],
           followUpAnswers: [
             {
               questionKey: "core_conflict",

@@ -655,6 +655,8 @@ async function main() {
       cookies,
     );
     assertOk(referenceCreate, "reference upload");
+    const referenceItem = referenceCreate.data.items?.[0];
+    assert(referenceItem, "reference upload did not return the uploaded reference item.");
 
     const artifactsInitial = await fetchJson(
       `${baseUrl}/api/projects/${projectId}/artifacts`,
@@ -978,7 +980,7 @@ async function main() {
           endpointId,
           modelId: "gpt-4o-mini",
           selectedArtifactIds: [worldBibleArtifact.id, taskPlanArtifact.id],
-          selectedReferenceIds: [referenceCreate.data.id],
+          selectedReferenceIds: [referenceItem.id],
           selectedMcpServerIds: [],
           generationOptions: {
             temperature: 0,
@@ -1081,7 +1083,7 @@ async function main() {
     );
     assert(
       Array.isArray(researchRun.selectedReferenceIds) &&
-        researchRun.selectedReferenceIds.includes(referenceCreate.data.id),
+        researchRun.selectedReferenceIds.includes(referenceItem.id),
       "research_fact_check run did not persist the selected reference id.",
     );
 
@@ -1848,7 +1850,7 @@ async function main() {
         grokBaseUrl,
         projectId,
         endpointId,
-        referenceId: referenceCreate.data.id,
+        referenceId: referenceItem.id,
         settingRunId: settingRun.id,
         outlineRunId: outlineRun.id,
         researchRunId: researchRun.id,

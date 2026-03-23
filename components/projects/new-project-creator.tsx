@@ -42,6 +42,31 @@ type BlankPreparationResult = {
   appliedArtifactKeys: string[];
 };
 
+type GuidedSessionEnvelope = {
+  session: OnboardingSessionPayload;
+};
+
+type GuidedSessionStreamEvent =
+  | {
+      type: "started";
+    }
+  | {
+      type: "text-delta";
+      text: string;
+    }
+  | {
+      type: "completed";
+      payload: unknown;
+    }
+  | {
+      type: "error";
+      error: {
+        code?: string;
+        message?: string;
+        details?: unknown;
+      };
+    };
+
 const STANDARD_ARTIFACTS = [
   "story_background.md",
   "world_bible.md",
@@ -71,6 +96,10 @@ const GUIDED_OVERLAYS = ["onboarding_brief.md", "project_prompt_pack.md", "proje
 const BLANK_STEP_TITLES = ["基础资料", "作者材料", "整理方式", "补充关键信息"] as const;
 const GUIDED_FOLLOW_UP_HINTS = ["主角目标与核心冲突", "世界规则与禁忌", "势力关系与关键人物", "文风约束与考据边界"] as const;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 function readErrorMessage(payload: unknown) {
   if (
     payload &&
@@ -96,6 +125,47 @@ async function requestJson<T>(input: RequestInfo, init?: RequestInit) {
   }
 
   return payload as T;
+}
+
+function parseGuidedSessionEnvelope(payload: unknown): GuidedSessionEnvelope | null {
+  if (!isRecord(payload) || !isRecord(payload.session)) {
+    return null;
+  }
+
+  return {
+    session: payload.session as OnboardingSessionPayload,
+  };
+}
+
+function parseGuidedSessionStreamEvent(payload: unknown): GuidedSessionStreamEvent | null {
+  if (!isRecord(payload) || typeof payload.type !== "string") {
+    return null;
+  }
+
+  switch (payload.type) {
+    case "started":
+      return { type: "started" };
+    case "text-delta":
+      return typeof payload.text === "string" ? { type: "text-delta", text: payload.text } : null;
+    case "completed":
+      return {
+        type: "completed",
+        payload: payload.payload ?? null,
+      };
+    case "error":
+      return {
+        type: "error",
+        error: isRecord(payload.error)
+          ? {
+              code: typeof payload.error.code === "string" ? payload.error.code : undefined,
+              message: typeof payload.error.message === "string" ? payload.error.message : undefined,
+              details: payload.error.details,
+            }
+          : {},
+      };
+    default:
+      return null;
+  }
 }
 
 function getOnboardingStatusLabel(status: OnboardingSessionPayload["status"] | string | null | undefined) {
@@ -194,6 +264,8 @@ export function NewProjectCreator({
   });
   const [guidedAnswer, setGuidedAnswer] = useState("");
   const [guidedPending, setGuidedPending] = useState(false);
+  const [guidedStreamingStage, setGuidedStreamingStage] = useState<"create" | "advance" | null>(null);
+  const [guidedStreamingOutput, setGuidedStreamingOutput] = useState("");
   const [guidedError, setGuidedError] = useState<string | null>(null);
   const [guidedMessage, setGuidedMessage] = useState<string | null>(null);
   const [finalizeForm, setFinalizeForm] = useState({
@@ -231,6 +303,12 @@ export function NewProjectCreator({
     return [...GUIDED_FOLLOW_UP_HINTS];
   }, [guidedSeed.era, guidedSeed.genre, guidedSeed.keywords]);
   const guidedUsesAi = Boolean(guidedSeed.endpointId && guidedSeed.modelId.trim());
+  const guidedStreamingLabel =
+    guidedStreamingStage === "create"
+      ? "AI 正在生成首问"
+      : guidedStreamingStage === "advance"
+        ? "AI 正在组织下一问"
+        : null;
   const canRunBlankAiPreparation =
     blankForm.prepareWithAi &&
     blankFiles.length > 0 &&
@@ -676,10 +754,11 @@ export function NewProjectCreator({
     setGuidedMessage(null);
 
     try {
-      const payload = await requestJson<{ session: OnboardingSessionPayload }>("/api/projects/bootstrap/session", {
+      const response = await fetch("/api/projects/bootstrap/session", {
         method: "POST",
         headers: {
           "content-type": "application/json",
+          accept: "application/x-ndjson, application/json",
         },
         body: JSON.stringify({
           name: guidedSeed.name.trim(),
@@ -693,15 +772,17 @@ export function NewProjectCreator({
         }),
       });
 
-      setSession(payload.session);
-      setSessionId(payload.session.id);
-      setGuidedAnswer(payload.session.currentQuestion?.answer ?? "");
+      const contentType = response.headers.get("content-type") ?? "";
+      const nextSession = contentType.includes("application/x-ndjson")
+        ? await consumeGuidedSessionStream(response, "create")
+        : await readGuidedSessionResponse(response);
+
+      applyGuidedSession(nextSession);
       setGuidedMessage(
-        payload.session.mode === "ai_dynamic"
-          ? `已使用 ${payload.session.runtime?.endpointLabel ?? "所选接口"} 建立 AI 动态引导会话。`
+        nextSession.mode === "ai_dynamic"
+          ? `已使用 ${nextSession.runtime?.endpointLabel ?? "所选接口"} 建立 AI 动态引导会话。`
           : "已建立本地引导问卷会话。",
       );
-      syncUrl("guided", payload.session.id);
     } catch (error) {
       setGuidedError(error instanceof Error ? error.message : "创建初始化会话失败。");
     } finally {
@@ -719,22 +800,24 @@ export function NewProjectCreator({
     setGuidedMessage(null);
 
     try {
-      const payload = await requestJson<{ session: OnboardingSessionPayload }>(
-        `/api/projects/bootstrap/session/${sessionId}/answer`,
-        {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({
-            action,
-            answer: action === "back" ? undefined : guidedAnswer,
-          }),
+      const response = await fetch(`/api/projects/bootstrap/session/${sessionId}/answer`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/x-ndjson, application/json",
         },
-      );
+        body: JSON.stringify({
+          action,
+          answer: action === "back" ? undefined : guidedAnswer,
+        }),
+      });
+      const contentType = response.headers.get("content-type") ?? "";
+      const nextSession =
+        contentType.includes("application/x-ndjson") && action !== "back"
+          ? await consumeGuidedSessionStream(response, "advance")
+          : await readGuidedSessionResponse(response);
 
-      setSession(payload.session);
-      setGuidedAnswer(payload.session.currentQuestion?.answer ?? "");
+      applyGuidedSession(nextSession);
       if (action === "skip") {
         setGuidedMessage("已跳过这一问。");
       }
@@ -743,6 +826,128 @@ export function NewProjectCreator({
     } finally {
       setGuidedPending(false);
     }
+  }
+
+  function applyGuidedSession(nextSession: OnboardingSessionPayload) {
+    setSession(nextSession);
+    setSessionId(nextSession.id);
+    setGuidedAnswer(nextSession.currentQuestion?.answer ?? "");
+    syncUrl("guided", nextSession.id);
+  }
+
+  async function readGuidedSessionResponse(response: Response) {
+    const payload = (await response.json().catch(() => null)) as unknown;
+
+    if (!response.ok) {
+      throw new Error(readErrorMessage(payload));
+    }
+
+    const envelope = parseGuidedSessionEnvelope(payload);
+    if (!envelope) {
+      throw new Error("初始化会话返回格式不正确。");
+    }
+
+    return envelope.session;
+  }
+
+  async function consumeGuidedSessionStream(response: Response, stage: "create" | "advance") {
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => null)) as unknown;
+      throw new Error(readErrorMessage(payload));
+    }
+
+    if (!response.body) {
+      throw new Error("未收到引导问答的流式响应体。");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let completedPayload: unknown = null;
+    let streamError: string | null = null;
+
+    setGuidedStreamingStage(stage);
+    setGuidedStreamingOutput("");
+    setGuidedMessage(stage === "create" ? "AI 正在生成首问..." : "AI 正在生成下一问...");
+
+    async function handleLine(line: string) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return;
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        throw new Error("引导问答返回了无法解析的流式事件。");
+      }
+
+      const event = parseGuidedSessionStreamEvent(parsed);
+      if (!event) {
+        return;
+      }
+
+      switch (event.type) {
+        case "started":
+          setGuidedMessage(stage === "create" ? "模型已开始生成首问。" : "模型已开始生成下一问。");
+          break;
+        case "text-delta":
+          setGuidedStreamingOutput((current) => current + event.text);
+          break;
+        case "completed":
+          completedPayload = event.payload;
+          break;
+        case "error":
+          streamError = readErrorMessage({
+            error: {
+              code: event.error.code,
+              message: event.error.message ?? "AI 引导问答失败。",
+              details: event.error.details,
+            },
+          });
+          break;
+      }
+    }
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          await handleLine(line);
+        }
+      }
+
+      const tail = `${buffer}${decoder.decode()}`.trim();
+      if (tail) {
+        await handleLine(tail);
+      }
+    } finally {
+      reader.releaseLock();
+      setGuidedStreamingStage(null);
+    }
+
+    if (streamError) {
+      setGuidedStreamingOutput("");
+      throw new Error(streamError);
+    }
+
+    const envelope = parseGuidedSessionEnvelope(completedPayload);
+    if (!envelope) {
+      setGuidedStreamingOutput("");
+      throw new Error("引导问答流已结束，但没有返回完整会话结果。");
+    }
+
+    setGuidedStreamingOutput("");
+    return envelope.session;
   }
 
   async function handleFinalizeGuidedProject(event: React.FormEvent<HTMLFormElement>) {
@@ -1339,6 +1544,20 @@ export function NewProjectCreator({
                         {guidedPending ? "初始化中" : guidedUsesAi ? "开始 AI 动态提问" : "开始本地引导问卷"}
                       </Button>
                     </div>
+                    {guidedStreamingLabel ? (
+                      <div className="rounded-[24px] border border-[var(--line)] bg-[rgba(255,250,242,0.88)] p-5">
+                        <p className="text-xs tracking-[0.16em] text-[var(--muted-ink)] uppercase">实时生成</p>
+                        <h3 className="mt-2 font-serif text-lg text-[var(--ink)]">{guidedStreamingLabel}</h3>
+                        <p className="mt-2 text-sm leading-7 text-[var(--ink-soft)]">
+                          {guidedStreamingOutput.trim()
+                            ? "模型正在返回中，最终会自动整理成正式问题。"
+                            : "正在等待模型返回首段内容..."}
+                        </p>
+                        <pre className="mt-4 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-[18px] bg-[var(--paper)] p-4 text-xs leading-6 text-[var(--muted-ink)]">
+                          {guidedStreamingOutput.trim() || "正在等待模型返回首段内容..."}
+                        </pre>
+                      </div>
+                    ) : null}
                     {guidedError ? <p className="mt-4 text-sm text-[#9f3a2f]">{guidedError}</p> : null}
                   </form>
                 ) : (
@@ -1358,6 +1577,21 @@ export function NewProjectCreator({
                       </div>
                       <Badge>{getOnboardingStatusLabel(session.status)}</Badge>
                     </div>
+
+                    {guidedStreamingLabel ? (
+                      <div className="rounded-[24px] border border-[var(--line)] bg-[rgba(255,250,242,0.88)] p-5">
+                        <p className="text-xs tracking-[0.16em] text-[var(--muted-ink)] uppercase">实时生成</p>
+                        <h3 className="mt-2 font-serif text-lg text-[var(--ink)]">{guidedStreamingLabel}</h3>
+                        <p className="mt-2 text-sm leading-7 text-[var(--ink-soft)]">
+                          {guidedStreamingOutput.trim()
+                            ? "模型正在返回中，最终会自动整理成正式问题。"
+                            : "正在等待模型返回首段内容..."}
+                        </p>
+                        <pre className="mt-4 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-[18px] bg-[var(--paper)] p-4 text-xs leading-6 text-[var(--muted-ink)]">
+                          {guidedStreamingOutput.trim() || "正在等待模型返回首段内容..."}
+                        </pre>
+                      </div>
+                    ) : null}
 
                     {session.currentQuestion ? (
                       <div className="rounded-[24px] border border-[var(--line)] bg-[rgba(255,255,255,0.48)] p-5">

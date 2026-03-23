@@ -587,8 +587,10 @@ async function main() {
       cookies,
     );
     assertOk(referenceCreate, "reference upload");
-    assert(referenceCreate.data.sourceType === "markdown", `expected markdown reference, got ${referenceCreate.data.sourceType}`);
-    assert(referenceCreate.data.storageKey, "reference upload did not persist storageKey.");
+    const referenceItem = referenceCreate.data.items?.[0];
+    assert(referenceItem, "reference upload did not return the uploaded reference item.");
+    assert(referenceItem.sourceType === "markdown", `expected markdown reference, got ${referenceItem.sourceType}`);
+    assert(referenceItem.storageKey, "reference upload did not persist storageKey.");
 
     const references = await fetchJson(
       `${baseUrl}/api/projects/${projectId}/references`,
@@ -599,7 +601,7 @@ async function main() {
     );
     assertOk(references, "references listing");
 
-    const reference = references.data.items.find((item) => item.id === referenceCreate.data.id);
+    const reference = references.data.items.find((item) => item.id === referenceItem.id);
     assert(reference, "uploaded reference was not listed.");
     assert(reference.normalizedText?.includes("九州城依河设港"), "uploaded reference normalizedText was missing.");
 

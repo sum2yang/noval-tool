@@ -1,6 +1,6 @@
 import "server-only";
 
-import { generateText, stepCountIs, type LanguageModelUsage, type StepResult, type ToolSet } from "ai";
+import { generateText, stepCountIs, streamText, type LanguageModelUsage, type StepResult, type ToolSet } from "ai";
 import type { McpServer, Prisma, ProviderEndpoint } from "@prisma/client";
 
 import { ApiError } from "@/lib/api/http";
@@ -39,6 +39,35 @@ export type GenerationExecutionResult = {
   usage: Prisma.InputJsonValue;
   toolCallsSummary: Prisma.InputJsonValue;
 };
+
+export type GenerationExecutionStreamResult = {
+  textStream: AsyncIterable<string>;
+  completed: Promise<GenerationExecutionResult>;
+};
+
+type GenerationStreamCompletionMetadata = {
+  usage: LanguageModelUsage;
+  finishReason: string;
+  warnings: string[];
+  steps: Array<StepResult<ToolSet>>;
+};
+
+type DeferredPromise<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+};
+
+function createDeferredPromise<T>(): DeferredPromise<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+
+  return { promise, resolve, reject };
+}
 
 function sanitizeToolNamespace(name: string, fallback: string) {
   const cleaned = name
@@ -85,6 +114,24 @@ function summarizeToolSteps(steps: Array<StepResult<ToolSet>>) {
       }));
     }),
   );
+}
+
+function toExecutionResult(
+  output: string,
+  usage: LanguageModelUsage,
+  finishReason: string,
+  warnings: string[],
+  toolInventory: ToolInventoryRow[],
+  steps: Array<StepResult<ToolSet>>,
+): GenerationExecutionResult {
+  return {
+    output,
+    usage: toSerializableUsage(usage, finishReason, warnings),
+    toolCallsSummary: toPrismaJson({
+      toolInventory,
+      calls: summarizeToolSteps(steps),
+    }),
+  };
 }
 
 async function loadMcpTools(servers: McpServer[]): Promise<LoadedMcpTools> {
@@ -183,6 +230,12 @@ export function normalizeGenerationError(error: unknown) {
   return new ApiError(500, "MODEL_UNAVAILABLE", "The model call failed.");
 }
 
+export function shouldUseStreamingGeneration(
+  endpoint: Pick<ProviderEndpoint, "providerType" | "openaiApiStyle">,
+) {
+  return endpoint.providerType === "openai" && endpoint.openaiApiStyle === "responses";
+}
+
 export async function executeGeneration(input: GenerationExecutionInput): Promise<GenerationExecutionResult> {
   const model = createLanguageModel(input.endpoint, input.modelId);
   const loadedMcpTools = await loadMcpTools(input.mcpServers ?? []);
@@ -215,16 +268,134 @@ export async function executeGeneration(input: GenerationExecutionInput): Promis
     warnings.push(...(result.warnings?.map((warning) => formatWarning(warning)) ?? []));
 
     return {
-      output,
-      usage: toSerializableUsage(result.totalUsage, result.finishReason, warnings),
-      toolCallsSummary: toPrismaJson({
-        toolInventory: loadedMcpTools.toolInventory,
-        calls: summarizeToolSteps(result.steps),
-      }),
+      ...toExecutionResult(
+        output,
+        result.totalUsage,
+        result.finishReason,
+        warnings,
+        loadedMcpTools.toolInventory,
+        result.steps,
+      ),
     };
   } catch (error) {
     throw normalizeGenerationError(error);
   } finally {
     await loadedMcpTools.closeAll();
   }
+}
+
+export async function executeGenerationStream(
+  input: GenerationExecutionInput,
+): Promise<GenerationExecutionStreamResult> {
+  const model = createLanguageModel(input.endpoint, input.modelId);
+  const loadedMcpTools = await loadMcpTools(input.mcpServers ?? []);
+  const completed = createDeferredPromise<GenerationExecutionResult>();
+  const finishMetadata = createDeferredPromise<GenerationStreamCompletionMetadata>();
+  void completed.promise.catch(() => undefined);
+  void finishMetadata.promise.catch(() => undefined);
+  let settled = false;
+  let streamedText = "";
+
+  async function resolveCompleted(value: GenerationExecutionResult) {
+    if (settled) {
+      return;
+    }
+
+    settled = true;
+    try {
+      completed.resolve(value);
+    } finally {
+      await loadedMcpTools.closeAll();
+    }
+  }
+
+  async function rejectCompleted(error: unknown) {
+    if (settled) {
+      return;
+    }
+
+    settled = true;
+    try {
+      completed.reject(normalizeGenerationError(error));
+    } finally {
+      await loadedMcpTools.closeAll();
+    }
+  }
+
+  function resolveFinishMetadata(value: GenerationStreamCompletionMetadata) {
+    finishMetadata.resolve(value);
+  }
+
+  function rejectFinishMetadata(error: unknown) {
+    finishMetadata.reject(normalizeGenerationError(error));
+  }
+
+  if ((input.mcpServers?.length ?? 0) > 0 && loadedMcpTools.toolInventory.length === 0) {
+    await loadedMcpTools.closeAll();
+    throw new ApiError(502, "MCP_UNAVAILABLE", "Selected MCP servers did not expose any runtime tools.");
+  }
+
+  const result = streamText({
+    model,
+    prompt: input.prompt,
+    temperature: input.temperature,
+    maxOutputTokens: input.maxOutputTokens,
+    timeout: {
+      totalMs: GENERATION_REQUEST_TIMEOUT_MS,
+    },
+    maxRetries: 0,
+    tools: Object.keys(loadedMcpTools.tools).length > 0 ? loadedMcpTools.tools : undefined,
+    stopWhen: Object.keys(loadedMcpTools.tools).length > 0 ? stepCountIs(5) : undefined,
+    onFinish: async (event) => {
+      resolveFinishMetadata({
+        usage: event.totalUsage,
+        finishReason: event.finishReason,
+        warnings: event.warnings?.map((warning) => formatWarning(warning)) ?? [],
+        steps: event.steps,
+      });
+    },
+    onAbort: async () => {
+      rejectFinishMetadata(new ApiError(499, "CANCELED", "The generation stream was aborted."));
+      await rejectCompleted(new ApiError(499, "CANCELED", "The generation stream was aborted."));
+    },
+    onError: async ({ error }) => {
+      rejectFinishMetadata(error);
+      await rejectCompleted(error);
+    },
+  });
+
+  return {
+    textStream: {
+      async *[Symbol.asyncIterator]() {
+        try {
+          for await (const chunk of result.textStream) {
+            streamedText += chunk;
+            yield chunk;
+          }
+
+          const metadata = await finishMetadata.promise;
+          const output = streamedText.trim();
+
+          if (!output) {
+            throw new ApiError(502, "OUTPUT_CONTRACT_ERROR", "The model returned an empty response.");
+          }
+
+          await resolveCompleted(
+            toExecutionResult(
+              output,
+              metadata.usage,
+              metadata.finishReason,
+              metadata.warnings,
+              loadedMcpTools.toolInventory,
+              metadata.steps,
+            ),
+          );
+        } catch (error) {
+          await rejectCompleted(error);
+          throw error;
+        }
+      },
+    },
+    completed: completed.promise,
+  };
 }

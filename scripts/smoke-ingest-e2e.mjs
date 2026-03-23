@@ -468,15 +468,17 @@ async function main() {
       cookies,
     );
     assertOk(markdownReference, "markdown reference upload");
+    const markdownReferenceItem = markdownReference.data.items?.[0];
+    assert(markdownReferenceItem, "markdown reference upload did not return an item.");
     assert(
-      markdownReference.data.sourceType === "markdown",
-      `expected markdown sourceType, got ${markdownReference.data.sourceType}`,
+      markdownReferenceItem.sourceType === "markdown",
+      `expected markdown sourceType, got ${markdownReferenceItem.sourceType}`,
     );
     assert(
-      markdownReference.data.extractionMethod === "markdown:utf8",
-      `expected markdown extraction method, got ${markdownReference.data.extractionMethod}`,
+      markdownReferenceItem.extractionMethod === "markdown:utf8",
+      `expected markdown extraction method, got ${markdownReferenceItem.extractionMethod}`,
     );
-    assert(markdownReference.data.storageKey, "markdown reference did not persist storageKey.");
+    assert(markdownReferenceItem.storageKey, "markdown reference did not persist storageKey.");
 
     const htmlForm = new FormData();
     htmlForm.set(
@@ -510,22 +512,24 @@ async function main() {
       cookies,
     );
     assertOk(htmlReference, "html reference upload");
+    const htmlReferenceItem = htmlReference.data.items?.[0];
+    assert(htmlReferenceItem, "html reference upload did not return an item.");
     assert(
-      htmlReference.data.sourceType === "html_static_topic",
-      `expected html_static_topic sourceType, got ${htmlReference.data.sourceType}`,
+      htmlReferenceItem.sourceType === "html_static_topic",
+      `expected html_static_topic sourceType, got ${htmlReferenceItem.sourceType}`,
     );
     assert(
-      htmlReference.data.extractionMethod === "html:readable_text",
-      `expected html extraction method, got ${htmlReference.data.extractionMethod}`,
+      htmlReferenceItem.extractionMethod === "html:readable_text",
+      `expected html extraction method, got ${htmlReferenceItem.extractionMethod}`,
     );
     assert(
-      typeof htmlReference.data.normalizedText === "string" &&
-        htmlReference.data.normalizedText.includes(htmlMarker) &&
-        htmlReference.data.normalizedText.includes(htmlOneboxMarker),
+      typeof htmlReferenceItem.normalizedText === "string" &&
+        htmlReferenceItem.normalizedText.includes(htmlMarker) &&
+        htmlReferenceItem.normalizedText.includes(htmlOneboxMarker),
       "html reference normalizedText did not keep the visible article content.",
     );
     assert(
-      !htmlReference.data.normalizedText.includes(scriptNoiseMarker),
+      !htmlReferenceItem.normalizedText.includes(scriptNoiseMarker),
       "html reference normalizedText still contained stripped script noise.",
     );
 
@@ -538,20 +542,20 @@ async function main() {
     );
     assertOk(references, "references listing");
 
-    const markdownReferenceItem = findItemById(
+    const listedMarkdownReferenceItem = findItemById(
       references.data.items,
-      markdownReference.data.id,
+      markdownReferenceItem.id,
       "markdown reference item",
     );
-    const htmlReferenceItem = findItemById(references.data.items, htmlReference.data.id, "html reference item");
+    const listedHtmlReferenceItem = findItemById(references.data.items, htmlReferenceItem.id, "html reference item");
 
     assert(
-      markdownReferenceItem.normalizedText?.includes(markdownMarker),
+      listedMarkdownReferenceItem.normalizedText?.includes(markdownMarker),
       "markdown reference normalizedText was missing the markdown marker.",
     );
     assert(
-      htmlReferenceItem.normalizedText?.includes(htmlMarker) &&
-        htmlReferenceItem.normalizedText?.includes(htmlOneboxMarker),
+      listedHtmlReferenceItem.normalizedText?.includes(htmlMarker) &&
+        listedHtmlReferenceItem.normalizedText?.includes(htmlOneboxMarker),
       "html reference listing did not keep the extracted readable text.",
     );
 

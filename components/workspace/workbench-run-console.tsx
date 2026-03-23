@@ -156,6 +156,28 @@ type LatestRunState = {
   archiveContentType: string | null;
 };
 
+type GenerateStreamEvent =
+  | {
+      type: "started";
+      runId: string;
+    }
+  | {
+      type: "text-delta";
+      text: string;
+    }
+  | {
+      type: "completed";
+      payload: unknown;
+    }
+  | {
+      type: "error";
+      error: {
+        code?: string;
+        message?: string;
+        details?: unknown;
+      };
+    };
+
 type PromptRoutingRow = {
   taskType: string;
   promptFile: string;
@@ -331,6 +353,37 @@ function parseLatestRunState(payload: unknown): LatestRunState | null {
   };
 }
 
+function parseGenerateStreamEvent(payload: unknown): GenerateStreamEvent | null {
+  if (!isRecord(payload) || typeof payload.type !== "string") {
+    return null;
+  }
+
+  switch (payload.type) {
+    case "started":
+      return typeof payload.runId === "string" ? { type: "started", runId: payload.runId } : null;
+    case "text-delta":
+      return typeof payload.text === "string" ? { type: "text-delta", text: payload.text } : null;
+    case "completed":
+      return {
+        type: "completed",
+        payload: payload.payload ?? null,
+      };
+    case "error":
+      return {
+        type: "error",
+        error: isRecord(payload.error)
+          ? {
+              code: typeof payload.error.code === "string" ? payload.error.code : undefined,
+              message: typeof payload.error.message === "string" ? payload.error.message : undefined,
+              details: payload.error.details,
+            }
+          : {},
+      };
+    default:
+      return null;
+  }
+}
+
 function filterArtifactsByKeys(artifacts: ArtifactItem[], artifactKeys: string[]) {
   const keySet = new Set(artifactKeys);
   return artifacts.filter((artifact) => keySet.has(artifact.artifactKey));
@@ -499,6 +552,8 @@ export function WorkbenchRunConsole({ project, mode }: WorkbenchRunConsoleProps)
   const [selectedMcpServerIds, setSelectedMcpServerIds] = useState<string[]>([]);
   const [appliedPromptTemplate, setAppliedPromptTemplate] = useState<AppliedMcpPromptTemplate | null>(null);
   const [latestRun, setLatestRun] = useState<LatestRunState | null>(null);
+  const [isStreamingRun, setIsStreamingRun] = useState(false);
+  const [streamingOutput, setStreamingOutput] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [activeDraftAction, setActiveDraftAction] = useState<string | null>(null);
@@ -729,6 +784,7 @@ export function WorkbenchRunConsole({ project, mode }: WorkbenchRunConsoleProps)
       method: "POST",
       headers: {
         "content-type": "application/json",
+        accept: "application/x-ndjson, application/json",
       },
       body: JSON.stringify({
         taskType: nextTaskType,
@@ -748,6 +804,17 @@ export function WorkbenchRunConsole({ project, mode }: WorkbenchRunConsoleProps)
       }),
     });
 
+    const contentType = response.headers.get("content-type") ?? "";
+
+    if (contentType.includes("application/x-ndjson")) {
+      if (!response.ok) {
+        throw new Error("流式生成启动失败。");
+      }
+
+      await consumeGenerateStream(response);
+      return;
+    }
+
     const payload = (await response.json().catch(() => null)) as unknown;
 
     if (!response.ok) {
@@ -760,6 +827,103 @@ export function WorkbenchRunConsole({ project, mode }: WorkbenchRunConsoleProps)
     }
 
     setLatestRun(nextRun);
+    setMessage("生成成功，草稿已写入结果面板。");
+    router.refresh();
+  }
+
+  async function consumeGenerateStream(response: Response) {
+    if (!response.body) {
+      throw new Error("未收到流式响应体。");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let completedPayload: unknown = null;
+    let streamError: string | null = null;
+
+    setIsStreamingRun(true);
+    setStreamingOutput("");
+    setMessage("正在流式生成，请等待完成。");
+
+    async function handleLine(line: string) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return;
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        throw new Error("流式生成返回了无法解析的事件。");
+      }
+
+      const event = parseGenerateStreamEvent(parsed);
+      if (!event) {
+        return;
+      }
+
+      switch (event.type) {
+        case "started":
+          setMessage("模型已开始返回内容。");
+          break;
+        case "text-delta":
+          setStreamingOutput((current) => current + event.text);
+          break;
+        case "completed":
+          completedPayload = event.payload;
+          break;
+        case "error":
+          streamError = readErrorMessage({
+            error: {
+              code: event.error.code,
+              message: event.error.message ?? "流式生成失败。",
+              details: event.error.details,
+            },
+          });
+          break;
+      }
+    }
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          await handleLine(line);
+        }
+      }
+
+      const tail = `${buffer}${decoder.decode()}`.trim();
+      if (tail) {
+        await handleLine(tail);
+      }
+    } finally {
+      reader.releaseLock();
+      setIsStreamingRun(false);
+    }
+
+    if (streamError) {
+      setStreamingOutput("");
+      throw new Error(streamError);
+    }
+
+    const nextRun = parseLatestRunState(completedPayload);
+    if (!nextRun) {
+      setStreamingOutput("");
+      throw new Error("流式生成已结束，但没有收到完整结果。");
+    }
+
+    setLatestRun(nextRun);
+    setStreamingOutput("");
     setMessage("生成成功，草稿已写入结果面板。");
     router.refresh();
   }
@@ -1161,6 +1325,20 @@ export function WorkbenchRunConsole({ project, mode }: WorkbenchRunConsoleProps)
                   </li>
                   <li>输出要求：{taskConfig.outputContract}</li>
                 </ul>
+
+                {isStreamingRun ? (
+                  <div className="mt-4 space-y-3">
+                    <div className="rounded-[20px] border border-[var(--line)] bg-[var(--paper)] p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <p className="text-xs tracking-[0.14em] text-[var(--muted-ink)] uppercase">实时输出</p>
+                        <Badge className="bg-[rgba(85,109,89,0.12)] text-[#556d59]">流式生成中</Badge>
+                      </div>
+                      <pre className="mt-2 whitespace-pre-wrap text-sm leading-7 text-[var(--ink-soft)]">
+                        {streamingOutput.trim() ? streamingOutput : "正在等待模型返回首段内容..."}
+                      </pre>
+                    </div>
+                  </div>
+                ) : null}
 
                 {latestRun ? (
                   <div className="mt-4 space-y-3">

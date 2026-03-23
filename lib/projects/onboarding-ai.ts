@@ -1,7 +1,7 @@
 import "server-only";
 
 import type { ProviderEndpoint } from "@prisma/client";
-import { generateText } from "ai";
+import { generateText, streamText } from "ai";
 
 import { ApiError } from "@/lib/api/http";
 import { normalizeGenerationError } from "@/lib/generation/execute";
@@ -22,6 +22,11 @@ type PlanAiOnboardingQuestionInput = {
   summary: OnboardingSummary;
 };
 
+export type PlanAiOnboardingQuestionStreamResult = {
+  textStream: AsyncIterable<string>;
+  completed: Promise<DynamicOnboardingQuestion>;
+};
+
 type RawAiOnboardingQuestionResult = {
   questionKey: OnboardingQuestionKey;
   title: string;
@@ -33,6 +38,23 @@ type RawAiOnboardingQuestionResult = {
 const QUESTION_BY_KEY = new Map(ONBOARDING_QUESTIONS.map((question) => [question.key, question]));
 const AI_ONBOARDING_PROMPT_MARKER = "ONBOARDING_DYNAMIC_JSON";
 const AI_ONBOARDING_TIMEOUT_MS = 120000;
+
+type DeferredPromise<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+};
+
+function createDeferredPromise<T>(): DeferredPromise<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+
+  return { promise, resolve, reject };
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -193,12 +215,37 @@ function buildAiOnboardingPrompt(summary: OnboardingSummary, remainingKeys: Onbo
   ].join("\n");
 }
 
+function getRemainingQuestionKeys(answers: OnboardingAnswerEntry[]) {
+  return ONBOARDING_QUESTIONS
+    .map((question) => question.key)
+    .filter((key) => !answers.some((entry) => entry.questionKey === key && (entry.answer || entry.skipped)));
+}
+
+function buildDynamicOnboardingQuestion(text: string, remainingKeys: OnboardingQuestionKey[]) {
+  const parsed = extractJsonObject(text);
+  const nextQuestion = coerceAiOnboardingQuestionResult(parsed, new Set(remainingKeys));
+  const canonicalQuestion = QUESTION_BY_KEY.get(nextQuestion.questionKey);
+
+  if (!canonicalQuestion) {
+    throw new ApiError(502, "OUTPUT_CONTRACT_ERROR", `Unknown onboarding question key: ${nextQuestion.questionKey}`);
+  }
+
+  return {
+    key: canonicalQuestion.key,
+    title: nextQuestion.title,
+    prompt: nextQuestion.prompt,
+    placeholder: nextQuestion.placeholder,
+    optional: canonicalQuestion.optional,
+    recommendedOptions: nextQuestion.recommendedOptions,
+    askedAt: new Date().toISOString(),
+    source: "ai" as const,
+  };
+}
+
 export async function planAiOnboardingQuestion(
   input: PlanAiOnboardingQuestionInput,
 ): Promise<DynamicOnboardingQuestion> {
-  const remainingKeys = ONBOARDING_QUESTIONS
-    .map((question) => question.key)
-    .filter((key) => !input.answers.some((entry) => entry.questionKey === key && (entry.answer || entry.skipped)));
+  const remainingKeys = getRemainingQuestionKeys(input.answers);
 
   if (remainingKeys.length === 0) {
     throw new ApiError(422, "VALIDATION_ERROR", "No onboarding question remains for AI planning.");
@@ -215,25 +262,77 @@ export async function planAiOnboardingQuestion(
         totalMs: AI_ONBOARDING_TIMEOUT_MS,
       },
     });
-    const parsed = extractJsonObject(result.text);
-    const nextQuestion = coerceAiOnboardingQuestionResult(parsed, new Set(remainingKeys));
-    const canonicalQuestion = QUESTION_BY_KEY.get(nextQuestion.questionKey);
-
-    if (!canonicalQuestion) {
-      throw new ApiError(502, "OUTPUT_CONTRACT_ERROR", `Unknown onboarding question key: ${nextQuestion.questionKey}`);
-    }
-
-    return {
-      key: canonicalQuestion.key,
-      title: nextQuestion.title,
-      prompt: nextQuestion.prompt,
-      placeholder: nextQuestion.placeholder,
-      optional: canonicalQuestion.optional,
-      recommendedOptions: nextQuestion.recommendedOptions,
-      askedAt: new Date().toISOString(),
-      source: "ai",
-    };
+    return buildDynamicOnboardingQuestion(result.text, remainingKeys);
   } catch (error) {
     throw normalizeGenerationError(error);
   }
+}
+
+export async function planAiOnboardingQuestionStream(
+  input: PlanAiOnboardingQuestionInput,
+): Promise<PlanAiOnboardingQuestionStreamResult> {
+  const remainingKeys = getRemainingQuestionKeys(input.answers);
+
+  if (remainingKeys.length === 0) {
+    throw new ApiError(422, "VALIDATION_ERROR", "No onboarding question remains for AI planning.");
+  }
+
+  const completed = createDeferredPromise<DynamicOnboardingQuestion>();
+  void completed.promise.catch(() => undefined);
+  let settled = false;
+  let streamedText = "";
+
+  async function resolveCompleted(value: DynamicOnboardingQuestion) {
+    if (settled) {
+      return;
+    }
+
+    settled = true;
+    completed.resolve(value);
+  }
+
+  async function rejectCompleted(error: unknown) {
+    if (settled) {
+      return;
+    }
+
+    settled = true;
+    completed.reject(normalizeGenerationError(error));
+  }
+
+  const result = streamText({
+    model: createLanguageModel(input.endpoint, input.modelId),
+    prompt: buildAiOnboardingPrompt(input.summary, remainingKeys),
+    temperature: 0.3,
+    maxOutputTokens: 1200,
+    maxRetries: 0,
+    timeout: {
+      totalMs: AI_ONBOARDING_TIMEOUT_MS,
+    },
+    onAbort: async () => {
+      await rejectCompleted(new ApiError(499, "CANCELED", "The onboarding stream was aborted."));
+    },
+    onError: async ({ error }) => {
+      await rejectCompleted(error);
+    },
+  });
+
+  return {
+    textStream: {
+      async *[Symbol.asyncIterator]() {
+        try {
+          for await (const chunk of result.textStream) {
+            streamedText += chunk;
+            yield chunk;
+          }
+
+          await resolveCompleted(buildDynamicOnboardingQuestion(streamedText, remainingKeys));
+        } catch (error) {
+          await rejectCompleted(error);
+          throw error;
+        }
+      },
+    },
+    completed: completed.promise,
+  };
 }

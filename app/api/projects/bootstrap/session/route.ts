@@ -1,7 +1,10 @@
+import type { Prisma } from "@prisma/client";
+
 import { prisma } from "@/lib/db";
 import { ApiError, jsonCreated, jsonError, parseJson } from "@/lib/api/http";
 import { onboardingSessionCreateSchema } from "@/lib/api/schemas";
 import { resolveRequestUser } from "@/lib/auth/identity";
+import { normalizeGenerationError, shouldUseStreamingGeneration } from "@/lib/generation/execute";
 import {
   buildOnboardingSeedAnswers,
   buildOnboardingSummary,
@@ -9,8 +12,52 @@ import {
   ONBOARDING_QUESTIONS,
   serializeOnboardingSession,
 } from "@/lib/projects/onboarding";
-import { planAiOnboardingQuestion } from "@/lib/projects/onboarding-ai";
+import { planAiOnboardingQuestion, planAiOnboardingQuestionStream } from "@/lib/projects/onboarding-ai";
 import { toPrismaJson } from "@/lib/prisma-json";
+
+function createNdjsonStreamWriter() {
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+
+  return {
+    readable,
+    async write(data: unknown) {
+      await writer.write(encoder.encode(`${JSON.stringify(data)}\n`));
+    },
+    async close() {
+      await writer.close();
+    },
+  };
+}
+
+function requestWantsNdjson(request: Request) {
+  const accept = request.headers.get("accept") ?? "";
+  return accept.includes("application/x-ndjson");
+}
+
+async function createSerializedOnboardingSession(input: {
+  userId: string;
+  status: "active" | "ready";
+  currentQuestionIndex: number;
+  answers: Prisma.InputJsonValue;
+  summary: Prisma.InputJsonValue;
+}) {
+  const session = await prisma.projectOnboardingSession.create({
+    data: {
+      userId: input.userId,
+      status: input.status,
+      currentQuestionIndex: input.currentQuestionIndex,
+      answers: input.answers,
+      summary: input.summary,
+    },
+  });
+
+  return serializeOnboardingSession({
+    ...session,
+    status: session.status,
+  });
+}
 
 export async function POST(request: Request) {
   try {
@@ -60,6 +107,74 @@ export async function POST(request: Request) {
           runtime,
           dynamicHistory: [],
         });
+
+        if (shouldUseStreamingGeneration(endpoint) && requestWantsNdjson(request)) {
+          const execution = await planAiOnboardingQuestionStream({
+            endpoint,
+            modelId: resolvedModelId,
+            answers: initialAnswers,
+            summary: seededSummary,
+          });
+          const stream = createNdjsonStreamWriter();
+
+          void (async () => {
+            try {
+              await stream.write({ type: "started" });
+
+              for await (const chunk of execution.textStream) {
+                if (!chunk) {
+                  continue;
+                }
+
+                await stream.write({
+                  type: "text-delta",
+                  text: chunk,
+                });
+              }
+
+              const firstQuestion = await execution.completed;
+              const nextSummary = buildOnboardingSummary(initialAnswers, {
+                mode: "ai_dynamic",
+                runtime,
+                dynamicHistory: [firstQuestion],
+              });
+              const session = await createSerializedOnboardingSession({
+                userId: user.id,
+                status: "active",
+                currentQuestionIndex: 0,
+                answers: toPrismaJson(initialAnswers),
+                summary: toPrismaJson(nextSummary),
+              });
+
+              await stream.write({
+                type: "completed",
+                payload: { session },
+              });
+            } catch (error) {
+              const normalized = normalizeGenerationError(error);
+              await stream.write({
+                type: "error",
+                error: {
+                  code: normalized.code,
+                  message: normalized.message,
+                  details: normalized.details ?? null,
+                },
+              });
+            } finally {
+              await stream.close().catch(() => undefined);
+            }
+          })();
+
+          return new Response(stream.readable, {
+            status: 200,
+            headers: {
+              "content-type": "application/x-ndjson; charset=utf-8",
+              "cache-control": "no-cache, no-transform",
+              "x-accel-buffering": "no",
+            },
+          });
+        }
+
         const firstQuestion = await planAiOnboardingQuestion({
           endpoint,
           modelId: resolvedModelId,
@@ -75,22 +190,15 @@ export async function POST(request: Request) {
       }
     }
 
-    const session = await prisma.projectOnboardingSession.create({
-      data: {
-        userId: user.id,
-        status,
-        currentQuestionIndex,
-        answers: toPrismaJson(initialAnswers),
-        summary: toPrismaJson(summary),
-      },
+    const session = await createSerializedOnboardingSession({
+      userId: user.id,
+      status,
+      currentQuestionIndex,
+      answers: toPrismaJson(initialAnswers),
+      summary: toPrismaJson(summary),
     });
 
-    return jsonCreated({
-      session: serializeOnboardingSession({
-        ...session,
-        status: session.status,
-      }),
-    });
+    return jsonCreated({ session });
   } catch (error) {
     return jsonError(error);
   }

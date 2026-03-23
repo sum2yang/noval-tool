@@ -1,4 +1,4 @@
-import type { HealthStatus } from "@prisma/client";
+import type { HealthStatus, Prisma } from "@prisma/client";
 
 import { prisma } from "@/lib/db";
 import { ApiError, jsonCreated, jsonError, parseJson } from "@/lib/api/http";
@@ -6,7 +6,12 @@ import { generateRequestSchema } from "@/lib/api/schemas";
 import { resolveRequestUser } from "@/lib/auth/identity";
 import { composeResolvedPrompt, resolveTaskDefinition } from "@/lib/generation/compose";
 import { buildProjectContext, buildSelectedReferences } from "@/lib/generation/context";
-import { executeGeneration, normalizeGenerationError } from "@/lib/generation/execute";
+import {
+  executeGeneration,
+  executeGenerationStream,
+  normalizeGenerationError,
+  shouldUseStreamingGeneration,
+} from "@/lib/generation/execute";
 import { buildGenerationArchiveCandidate, buildGenerationArchiveDownloadPath } from "@/lib/generation/archive";
 import {
   buildDefaultEditorLayoutPrefs,
@@ -116,6 +121,194 @@ function appendUniqueArtifacts<
     seen.add(artifact.id);
     return true;
   });
+}
+
+type ResolvedArtifactSummary = {
+  id: string;
+  artifactKey: string;
+  filename: string;
+};
+
+type SuccessfulGenerationPayload = {
+  draftId: string;
+  runId: string;
+  resolvedPrompt: string;
+  resolvedSkills: string[];
+  resolvedArtifacts: ResolvedArtifactSummary[];
+  output: string;
+  suggestedPatches: string[];
+  toolCallsSummary: unknown;
+  archiveDownloadUrl: string | null;
+  archiveObjectStoreMode: string | null;
+  archiveByteSize: number | null;
+  archiveContentType: string | null;
+};
+
+type PersistSuccessfulGenerationInput = {
+  projectId: string;
+  runId: string;
+  endpointId: string;
+  taskType: string;
+  targetArtifact: { id: string; kind: string } | null;
+  output: string;
+  suggestedPatches: string[];
+  usage: Prisma.InputJsonValue;
+  finalToolCallsSummary: Prisma.InputJsonValue;
+  storedArchive: Awaited<ReturnType<typeof putObject>> | null;
+  archiveCandidate: ReturnType<typeof buildGenerationArchiveCandidate>;
+};
+
+function buildSuccessfulGenerationPayload(input: {
+  projectId: string;
+  runId: string;
+  draftId: string;
+  resolvedPrompt: string;
+  resolvedSkills: string[];
+  resolvedArtifacts: ResolvedArtifactSummary[];
+  output: string;
+  suggestedPatches: string[];
+  toolCallsSummary: unknown;
+  storedArchive: Awaited<ReturnType<typeof putObject>> | null;
+  archiveCandidate: ReturnType<typeof buildGenerationArchiveCandidate>;
+}): SuccessfulGenerationPayload {
+  return {
+    draftId: input.draftId,
+    runId: input.runId,
+    resolvedPrompt: input.resolvedPrompt,
+    resolvedSkills: input.resolvedSkills,
+    resolvedArtifacts: input.resolvedArtifacts,
+    output: input.output,
+    suggestedPatches: input.suggestedPatches,
+    toolCallsSummary: input.toolCallsSummary,
+    archiveDownloadUrl: input.storedArchive ? buildGenerationArchiveDownloadPath(input.projectId, input.runId) : null,
+    archiveObjectStoreMode: input.storedArchive?.mode ?? null,
+    archiveByteSize: input.archiveCandidate?.byteSize ?? null,
+    archiveContentType: input.archiveCandidate?.contentType ?? null,
+  };
+}
+
+async function persistSuccessfulGeneration(input: PersistSuccessfulGenerationInput) {
+  const draft = await prisma.$transaction(async (tx) => {
+    await tx.providerEndpoint.update({
+      where: { id: input.endpointId },
+      data: {
+        healthStatus: "healthy",
+        lastHealthCheckAt: new Date(),
+      },
+    });
+
+    const nextDraft = await tx.draft.create({
+      data: {
+        projectId: input.projectId,
+        runId: input.runId,
+        artifactId: input.targetArtifact?.id,
+        taskType: input.taskType,
+        outputContent: input.output,
+        suggestedPatches: input.suggestedPatches,
+        status: "ready",
+        draftKind: input.taskType === "review_content" ? "review_revision" : "generated_output",
+      },
+    });
+
+    await tx.generationRun.update({
+      where: { id: input.runId },
+      data: {
+        usage: input.usage,
+        toolCallsSummary: input.finalToolCallsSummary,
+        archiveStorageKey: input.storedArchive?.key ?? null,
+        archiveObjectStoreMode: input.storedArchive?.mode ?? null,
+        archiveByteSize: input.archiveCandidate?.byteSize ?? null,
+        archiveContentType: input.archiveCandidate?.contentType ?? null,
+        status: "succeeded",
+        errorSummary: null,
+      },
+    });
+
+    if (input.targetArtifact?.kind === "project_chapter") {
+      const preference = await tx.projectPreference.findUnique({
+        where: {
+          projectId: input.projectId,
+        },
+      });
+      const chapterIndex = normalizeChapterIndex(preference?.chapterIndex);
+      const nextChapterIndex = updateChapterIndexEntry(chapterIndex, input.targetArtifact.id, {
+        latestDraftId: nextDraft.id,
+        wordCount: countNovelWords(input.output),
+        status: "reviewing",
+        updatedAt: new Date().toISOString(),
+      });
+
+      await tx.projectPreference.upsert({
+        where: {
+          projectId: input.projectId,
+        },
+        update: {
+          chapterIndex: toPrismaJson(nextChapterIndex),
+          activeChapterArtifactId: input.targetArtifact.id,
+        },
+        create: {
+          projectId: input.projectId,
+          defaultTaskType: "workflow_check",
+          ledgerEnabled: false,
+          showSelfCheck: true,
+          showSettlement: true,
+          activeChapterArtifactId: input.targetArtifact.id,
+          chapterIndex: toPrismaJson(nextChapterIndex),
+          editorLayoutPrefs: toPrismaJson(buildDefaultEditorLayoutPrefs()),
+        },
+      });
+    }
+
+    return nextDraft;
+  });
+
+  return draft;
+}
+
+async function markGenerationFailed(runId: string, normalized: ApiError) {
+  await Promise.allSettled([
+    prisma.generationRun.update({
+      where: { id: runId },
+      data: {
+        status: "failed",
+        errorSummary: normalized.message,
+      },
+    }),
+    prisma.providerEndpoint.updateMany({
+      where: {
+        generationRuns: {
+          some: {
+            id: runId,
+          },
+        },
+      },
+      data: {
+        healthStatus: mapGenerationErrorToHealthStatus(normalized),
+        lastHealthCheckAt: new Date(),
+      },
+    }),
+  ]);
+}
+
+function createNdjsonStreamWriter() {
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+
+  return {
+    readable,
+    async write(data: unknown) {
+      await writer.write(encoder.encode(`${JSON.stringify(data)}\n`));
+    },
+    async close() {
+      await writer.close();
+    },
+  };
+}
+
+function requestWantsNdjson(request: Request) {
+  const accept = request.headers.get("accept") ?? "";
+  return accept.includes("application/x-ndjson");
 }
 
 export async function POST(
@@ -382,6 +575,169 @@ export async function POST(
     });
     runId = run.id;
 
+    const persistCompletedGeneration = async (execution: {
+      output: string;
+      usage: Prisma.InputJsonValue;
+      toolCallsSummary: Prisma.InputJsonValue;
+    }) => {
+      const finalToolCallsSummary = mergeToolCallSummary(
+        execution.toolCallsSummary,
+        supplementalSummaryJson && typeof supplementalSummaryJson === "object" && !Array.isArray(supplementalSummaryJson)
+          ? (supplementalSummaryJson as Record<string, unknown>)
+          : undefined,
+      );
+      const externalSearchSessionId = extractExternalSearchSessionId(finalToolCallsSummary);
+      const externalSearchTrace = externalSearchSessionId
+        ? await getGrokSearchTrace(id, externalSearchSessionId)
+        : null;
+      const archiveCandidate = buildGenerationArchiveCandidate({
+        projectId: id,
+        runId: run.id,
+        taskType: payload.taskType,
+        endpointId: endpoint.id,
+        modelId: payload.modelId,
+        resolvedPrompt: composed.resolvedPrompt,
+        resolvedSkills: composed.resolvedSkills.map((skill) => ({ name: skill.name })),
+        resolvedContextArtifacts: resolvedArtifactsForRun.map((artifact) => ({
+          id: artifact.id,
+          artifactKey: artifact.artifactKey,
+          filename: artifact.filename,
+        })),
+        toolCallsSummary: finalToolCallsSummary,
+        usage: execution.usage,
+        output: execution.output,
+        suggestedPatches,
+        targetArtifactId: targetArtifact?.id,
+        externalSearchTrace: externalSearchTrace
+          ? {
+              sessionId: externalSearchTrace.sessionId,
+              createdAt: externalSearchTrace.createdAt.toISOString(),
+              requestPayload: externalSearchTrace.requestPayload,
+              responsePayload: externalSearchTrace.responsePayload,
+              sourceItems: externalSearchTrace.sourceItems,
+            }
+          : null,
+      });
+      const storedArchive = archiveCandidate
+        ? await putObject({
+            key: archiveCandidate.key,
+            body: archiveCandidate.body,
+            contentType: archiveCandidate.contentType,
+            metadata: {
+              projectId: id,
+              runId: run.id,
+              taskType: payload.taskType,
+            },
+          })
+        : null;
+
+      createdArchiveStorageKey = storedArchive?.key;
+
+      const draft = await persistSuccessfulGeneration({
+        projectId: id,
+        runId: run.id,
+        endpointId: endpoint.id,
+        taskType: payload.taskType,
+        targetArtifact: targetArtifact
+          ? {
+              id: targetArtifact.id,
+              kind: targetArtifact.kind,
+            }
+          : null,
+        output: execution.output,
+        suggestedPatches,
+        usage: execution.usage,
+        finalToolCallsSummary,
+        storedArchive,
+        archiveCandidate,
+      });
+
+      return buildSuccessfulGenerationPayload({
+        projectId: id,
+        runId: run.id,
+        draftId: draft.id,
+        resolvedPrompt: composed.resolvedPrompt,
+        resolvedSkills: composed.resolvedSkills.map((skill) => skill.name),
+        resolvedArtifacts: resolvedArtifactsForRun.map((artifact) => ({
+          id: artifact.id,
+          artifactKey: artifact.artifactKey,
+          filename: artifact.filename,
+        })),
+        output: execution.output,
+        suggestedPatches,
+        toolCallsSummary: finalToolCallsSummary,
+        storedArchive,
+        archiveCandidate,
+      });
+    };
+
+    if (shouldUseStreamingGeneration(endpoint) && requestWantsNdjson(request)) {
+      const execution = await executeGenerationStream({
+        endpoint,
+        modelId: payload.modelId,
+        prompt: composed.resolvedPrompt,
+        temperature: payload.generationOptions.temperature,
+        maxOutputTokens: payload.generationOptions.maxTokens,
+        mcpServers,
+      });
+      const stream = createNdjsonStreamWriter();
+
+      void (async () => {
+        try {
+          await stream.write({
+            type: "started",
+            runId: run.id,
+          });
+
+          for await (const chunk of execution.textStream) {
+            if (!chunk) {
+              continue;
+            }
+
+            await stream.write({
+              type: "text-delta",
+              text: chunk,
+            });
+          }
+
+          const successPayload = await persistCompletedGeneration(await execution.completed);
+          createdArchiveStorageKey = undefined;
+
+          await stream.write({
+            type: "completed",
+            payload: successPayload,
+          });
+        } catch (error) {
+          if (createdArchiveStorageKey) {
+            await deleteObject(createdArchiveStorageKey).catch(() => undefined);
+            createdArchiveStorageKey = undefined;
+          }
+
+          const normalized = normalizeGenerationError(error);
+          await markGenerationFailed(run.id, normalized);
+          await stream.write({
+            type: "error",
+            error: {
+              code: normalized.code,
+              message: normalized.message,
+              details: normalized.details ?? null,
+            },
+          });
+        } finally {
+          await stream.close().catch(() => undefined);
+        }
+      })();
+
+      return new Response(stream.readable, {
+        status: 200,
+        headers: {
+          "content-type": "application/x-ndjson; charset=utf-8",
+          "cache-control": "no-cache, no-transform",
+          "x-accel-buffering": "no",
+        },
+      });
+    }
+
     const execution = await executeGeneration({
       endpoint,
       modelId: payload.modelId,
@@ -390,151 +746,10 @@ export async function POST(
       maxOutputTokens: payload.generationOptions.maxTokens,
       mcpServers,
     });
-    const finalToolCallsSummary = mergeToolCallSummary(
-      execution.toolCallsSummary,
-      supplementalSummaryJson && typeof supplementalSummaryJson === "object" && !Array.isArray(supplementalSummaryJson)
-        ? (supplementalSummaryJson as Record<string, unknown>)
-        : undefined,
-    );
-    const externalSearchSessionId = extractExternalSearchSessionId(finalToolCallsSummary);
-    const externalSearchTrace = externalSearchSessionId
-      ? await getGrokSearchTrace(id, externalSearchSessionId)
-      : null;
-    const archiveCandidate = buildGenerationArchiveCandidate({
-      projectId: id,
-      runId: run.id,
-      taskType: payload.taskType,
-      endpointId: endpoint.id,
-      modelId: payload.modelId,
-      resolvedPrompt: composed.resolvedPrompt,
-      resolvedSkills: composed.resolvedSkills.map((skill) => ({ name: skill.name })),
-      resolvedContextArtifacts: resolvedArtifactsForRun.map((artifact) => ({
-        id: artifact.id,
-        artifactKey: artifact.artifactKey,
-        filename: artifact.filename,
-      })),
-      toolCallsSummary: finalToolCallsSummary,
-      usage: execution.usage,
-      output: execution.output,
-      suggestedPatches,
-      targetArtifactId: targetArtifact?.id,
-      externalSearchTrace: externalSearchTrace
-        ? {
-            sessionId: externalSearchTrace.sessionId,
-            createdAt: externalSearchTrace.createdAt.toISOString(),
-            requestPayload: externalSearchTrace.requestPayload,
-            responsePayload: externalSearchTrace.responsePayload,
-            sourceItems: externalSearchTrace.sourceItems,
-          }
-        : null,
-    });
-    const storedArchive = archiveCandidate
-      ? await putObject({
-          key: archiveCandidate.key,
-          body: archiveCandidate.body,
-          contentType: archiveCandidate.contentType,
-          metadata: {
-            projectId: id,
-            runId: run.id,
-            taskType: payload.taskType,
-          },
-        })
-      : null;
+    const successPayload = await persistCompletedGeneration(execution);
+    createdArchiveStorageKey = undefined;
 
-    createdArchiveStorageKey = storedArchive?.key;
-
-    const draft = await prisma.$transaction(async (tx) => {
-      await tx.providerEndpoint.update({
-        where: { id: endpoint.id },
-        data: {
-          healthStatus: "healthy",
-          lastHealthCheckAt: new Date(),
-        },
-      });
-
-      const nextDraft = await tx.draft.create({
-        data: {
-          projectId: id,
-          runId: run.id,
-          artifactId: targetArtifact?.id,
-          taskType: payload.taskType,
-          outputContent: execution.output,
-          suggestedPatches,
-          status: "ready",
-          draftKind: payload.taskType === "review_content" ? "review_revision" : "generated_output",
-        },
-      });
-
-      await tx.generationRun.update({
-        where: { id: run.id },
-        data: {
-          usage: execution.usage,
-          toolCallsSummary: finalToolCallsSummary,
-          archiveStorageKey: storedArchive?.key ?? null,
-          archiveObjectStoreMode: storedArchive?.mode ?? null,
-          archiveByteSize: archiveCandidate?.byteSize ?? null,
-          archiveContentType: archiveCandidate?.contentType ?? null,
-          status: "succeeded",
-          errorSummary: null,
-        },
-      });
-
-      if (targetArtifact?.kind === "project_chapter") {
-        const preference = await tx.projectPreference.findUnique({
-          where: {
-            projectId: id,
-          },
-        });
-        const chapterIndex = normalizeChapterIndex(preference?.chapterIndex);
-        const nextChapterIndex = updateChapterIndexEntry(chapterIndex, targetArtifact.id, {
-          latestDraftId: nextDraft.id,
-          wordCount: countNovelWords(execution.output),
-          status: "reviewing",
-          updatedAt: new Date().toISOString(),
-        });
-
-        await tx.projectPreference.upsert({
-          where: {
-            projectId: id,
-          },
-          update: {
-            chapterIndex: toPrismaJson(nextChapterIndex),
-            activeChapterArtifactId: targetArtifact.id,
-          },
-          create: {
-            projectId: id,
-            defaultTaskType: "workflow_check",
-            ledgerEnabled: false,
-            showSelfCheck: true,
-            showSettlement: true,
-            activeChapterArtifactId: targetArtifact.id,
-            chapterIndex: toPrismaJson(nextChapterIndex),
-            editorLayoutPrefs: toPrismaJson(buildDefaultEditorLayoutPrefs()),
-          },
-        });
-      }
-
-      return nextDraft;
-    });
-
-    return jsonCreated({
-      draftId: draft.id,
-      runId: run.id,
-      resolvedPrompt: composed.resolvedPrompt,
-      resolvedSkills: composed.resolvedSkills.map((skill) => skill.name),
-      resolvedArtifacts: resolvedArtifactsForRun.map((artifact) => ({
-        id: artifact.id,
-        artifactKey: artifact.artifactKey,
-        filename: artifact.filename,
-      })),
-      output: execution.output,
-      suggestedPatches,
-      toolCallsSummary: finalToolCallsSummary,
-      archiveDownloadUrl: storedArchive ? buildGenerationArchiveDownloadPath(id, run.id) : null,
-      archiveObjectStoreMode: storedArchive?.mode ?? null,
-      archiveByteSize: archiveCandidate?.byteSize ?? null,
-      archiveContentType: archiveCandidate?.contentType ?? null,
-    });
+    return jsonCreated(successPayload);
   } catch (error) {
     if (createdArchiveStorageKey) {
       await deleteObject(createdArchiveStorageKey).catch(() => undefined);
@@ -542,29 +757,7 @@ export async function POST(
 
     if (runId) {
       const normalized = normalizeGenerationError(error);
-
-      await Promise.allSettled([
-        prisma.generationRun.update({
-          where: { id: runId },
-          data: {
-            status: "failed",
-            errorSummary: normalized.message,
-          },
-        }),
-        prisma.providerEndpoint.updateMany({
-          where: {
-            generationRuns: {
-              some: {
-                id: runId,
-              },
-            },
-          },
-          data: {
-            healthStatus: mapGenerationErrorToHealthStatus(normalized),
-            lastHealthCheckAt: new Date(),
-          },
-        }),
-      ]);
+      await markGenerationFailed(runId, normalized);
 
       return jsonError(normalized);
     }

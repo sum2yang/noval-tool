@@ -406,6 +406,8 @@ async function main() {
       cookies,
     );
     assertOk(referenceCreate, "reference upload");
+    const referenceItem = referenceCreate.data.items?.[0];
+    assert(referenceItem, "reference upload did not return the uploaded reference item.");
 
     const endpoint = await fetchJson(
       `${baseUrl}/api/provider-endpoints`,
@@ -488,7 +490,7 @@ async function main() {
           endpointId,
           modelId: "gpt-4o-mini",
           selectedArtifactIds: [],
-          selectedReferenceIds: [referenceCreate.data.id],
+          selectedReferenceIds: [referenceItem.id],
           selectedMcpServerIds: [],
           generationOptions: {
             temperature: 0,
@@ -570,7 +572,7 @@ async function main() {
     assert(run.status === "succeeded", `expected run status succeeded, got ${run.status}`);
     assert(draft.status === "ready", `expected draft status ready, got ${draft.status}`);
     assert(
-      Array.isArray(run.selectedReferenceIds) && run.selectedReferenceIds.includes(referenceCreate.data.id),
+      Array.isArray(run.selectedReferenceIds) && run.selectedReferenceIds.includes(referenceItem.id),
       "generation run did not persist the selected reference id.",
     );
 
@@ -592,7 +594,7 @@ async function main() {
         grokBaseUrl,
         projectId,
         endpointId,
-        referenceId: referenceCreate.data.id,
+        referenceId: referenceItem.id,
         runId: generate.data.runId,
         draftId: generate.data.draftId,
         providerHealthStatus: providerHealth.data.status,

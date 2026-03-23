@@ -1,7 +1,10 @@
+import type { Prisma } from "@prisma/client";
+
 import { prisma } from "@/lib/db";
 import { ApiError, jsonError, jsonOk, parseJson } from "@/lib/api/http";
 import { onboardingSessionAnswerSchema } from "@/lib/api/schemas";
 import { resolveRequestUser } from "@/lib/auth/identity";
+import { normalizeGenerationError, shouldUseStreamingGeneration } from "@/lib/generation/execute";
 import {
   buildOnboardingSummary,
   getRemainingOnboardingQuestions,
@@ -10,8 +13,52 @@ import {
   serializeOnboardingSession,
   upsertOnboardingAnswer,
 } from "@/lib/projects/onboarding";
-import { planAiOnboardingQuestion } from "@/lib/projects/onboarding-ai";
+import { planAiOnboardingQuestion, planAiOnboardingQuestionStream } from "@/lib/projects/onboarding-ai";
 import { toPrismaJson } from "@/lib/prisma-json";
+
+function createNdjsonStreamWriter() {
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+
+  return {
+    readable,
+    async write(data: unknown) {
+      await writer.write(encoder.encode(`${JSON.stringify(data)}\n`));
+    },
+    async close() {
+      await writer.close();
+    },
+  };
+}
+
+function requestWantsNdjson(request: Request) {
+  const accept = request.headers.get("accept") ?? "";
+  return accept.includes("application/x-ndjson");
+}
+
+async function updateSerializedOnboardingSession(input: {
+  sessionId: string;
+  status: "active" | "ready";
+  currentQuestionIndex: number;
+  answers: Prisma.InputJsonValue;
+  summary: Prisma.InputJsonValue;
+}) {
+  const updatedSession = await prisma.projectOnboardingSession.update({
+    where: { id: input.sessionId },
+    data: {
+      status: input.status,
+      currentQuestionIndex: input.currentQuestionIndex,
+      answers: input.answers,
+      summary: input.summary,
+    },
+  });
+
+  return serializeOnboardingSession({
+    ...updatedSession,
+    status: updatedSession.status,
+  });
+}
 
 export async function POST(
   request: Request,
@@ -125,6 +172,75 @@ export async function POST(
             runtime: summary.runtime,
             dynamicHistory: nextHistory,
           });
+
+          if (shouldUseStreamingGeneration(endpoint) && requestWantsNdjson(request)) {
+            const execution = await planAiOnboardingQuestionStream({
+              endpoint,
+              modelId: summary.runtime.modelId,
+              answers: nextAnswers,
+              summary: partialSummary,
+            });
+            const stream = createNdjsonStreamWriter();
+
+            void (async () => {
+              try {
+                await stream.write({ type: "started" });
+
+                for await (const chunk of execution.textStream) {
+                  if (!chunk) {
+                    continue;
+                  }
+
+                  await stream.write({
+                    type: "text-delta",
+                    text: chunk,
+                  });
+                }
+
+                const nextQuestion = await execution.completed;
+                const nextDynamicHistory = [...nextHistory, nextQuestion];
+                const streamedSummary = buildOnboardingSummary(nextAnswers, {
+                  mode: summary.mode,
+                  runtime: summary.runtime,
+                  dynamicHistory: nextDynamicHistory,
+                });
+                const updatedSession = await updateSerializedOnboardingSession({
+                  sessionId: session.id,
+                  status: "active",
+                  currentQuestionIndex: Math.max(nextDynamicHistory.length - 1, 0),
+                  answers: toPrismaJson(nextAnswers),
+                  summary: toPrismaJson(streamedSummary),
+                });
+
+                await stream.write({
+                  type: "completed",
+                  payload: { session: updatedSession },
+                });
+              } catch (error) {
+                const normalized = normalizeGenerationError(error);
+                await stream.write({
+                  type: "error",
+                  error: {
+                    code: normalized.code,
+                    message: normalized.message,
+                    details: normalized.details ?? null,
+                  },
+                });
+              } finally {
+                await stream.close().catch(() => undefined);
+              }
+            })();
+
+            return new Response(stream.readable, {
+              status: 200,
+              headers: {
+                "content-type": "application/x-ndjson; charset=utf-8",
+                "cache-control": "no-cache, no-transform",
+                "x-accel-buffering": "no",
+              },
+            });
+          }
+
           const nextQuestion = await planAiOnboardingQuestion({
             endpoint,
             modelId: summary.runtime.modelId,
@@ -152,22 +268,15 @@ export async function POST(
       }
     }
 
-    const updatedSession = await prisma.projectOnboardingSession.update({
-      where: { id: session.id },
-      data: {
-        status: nextStatus,
-        currentQuestionIndex: nextQuestionIndex,
-        answers: toPrismaJson(nextAnswers),
-        summary: toPrismaJson(nextSummary),
-      },
+    const updatedSession = await updateSerializedOnboardingSession({
+      sessionId: session.id,
+      status: nextStatus,
+      currentQuestionIndex: nextQuestionIndex,
+      answers: toPrismaJson(nextAnswers),
+      summary: toPrismaJson(nextSummary),
     });
 
-    return jsonOk({
-      session: serializeOnboardingSession({
-        ...updatedSession,
-        status: updatedSession.status,
-      }),
-    });
+    return jsonOk({ session: updatedSession });
   } catch (error) {
     return jsonError(error);
   }

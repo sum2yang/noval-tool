@@ -780,6 +780,8 @@ async function main() {
       cookies,
     );
     assertOk(referenceCreate, "reference upload");
+    const referenceItem = referenceCreate.data.items?.[0];
+    assert(referenceItem, "reference upload did not return the uploaded reference item.");
 
     const endpoint = await fetchJson(
       `${baseUrl}/api/provider-endpoints`,
@@ -871,7 +873,7 @@ async function main() {
           modelId: "gpt-4o-mini",
           targetArtifactId: secondChapterArtifactId,
           selectedArtifactIds: [],
-          selectedReferenceIds: [referenceCreate.data.id],
+          selectedReferenceIds: [referenceItem.id],
           selectedMcpServerIds: [mcpId],
           generationOptions: {
             temperature: 0,
@@ -918,7 +920,7 @@ async function main() {
           modelId: "gpt-4o-mini",
           targetArtifactId: secondChapterArtifactId,
           selectedArtifactIds: [],
-          selectedReferenceIds: [referenceCreate.data.id],
+          selectedReferenceIds: [referenceItem.id],
           selectedMcpServerIds: [mcpId],
           generationOptions: {
             temperature: 0,
@@ -1014,7 +1016,7 @@ async function main() {
           endpointId,
           modelId: "gpt-4o-mini",
           selectedArtifactIds: [secondChapterArtifactId],
-          selectedReferenceIds: [referenceCreate.data.id],
+          selectedReferenceIds: [referenceItem.id],
           selectedMcpServerIds: [mcpId],
           generationOptions: {
             temperature: 0,
@@ -1059,7 +1061,7 @@ async function main() {
           endpointId,
           modelId: "gpt-4o-mini",
           selectedArtifactIds: [secondChapterArtifactId],
-          selectedReferenceIds: [referenceCreate.data.id],
+          selectedReferenceIds: [referenceItem.id],
           selectedMcpServerIds: [mcpId],
           generationOptions: {
             temperature: 0,
@@ -1446,7 +1448,7 @@ async function main() {
         projectId,
         endpointId,
         mcpId,
-        referenceId: referenceCreate.data.id,
+        referenceId: referenceItem.id,
         chapterArtifactId: secondChapterArtifactId,
         findingsArtifactId: findingsArtifact.id,
         chapterGuidanceAnswer,

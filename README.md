@@ -28,6 +28,7 @@
 - 章节编辑、自动保存、审稿定位
 - 项目级 API 预设（支持新增 / 删除 / 排序）
 - OpenAI 端点支持 `Responses API` / `Chat Completions API` 显式切换
+- OpenAI `Responses API` 在任务执行与 AI 引导创建里支持流式返回
 - 远程 MCP 接入
 - 用户级 Grok / Tavily / Firecrawl 配置
 - 设置页支持删除未绑定历史生成记录的模型接口与远程 MCP 服务
@@ -56,6 +57,7 @@
 引导创建说明：
 
 - 先选择模型接口与模型名时，会由模型根据题材生成首问，并在每次回答后动态决定下一问和推荐选项
+- 当所选 OpenAI 端点使用 `Responses API` 时，首问与后续追问会实时流式返回到页面
 - 没有选择模型接口时，会自动回退到当前内置本地问卷，不会阻塞项目初始化
 - 模型接口健康检查只验证“默认模型的最小探活请求”；如果正式生成携带大上下文、不同模型名或上游网关限制不同，仍可能在生成阶段失败
 
@@ -68,6 +70,7 @@
 - 对象存储：S3 兼容接口，默认可用 MinIO
 - 模型接入：OpenAI / Gemini / Anthropic 自定义 URL
 - OpenAI 兼容层：支持 `Responses API` 与 `Chat Completions API` 两种请求模式
+- 当 OpenAI 端点选择 `Responses API` 时，任务执行页与 AI 引导创建页会优先使用流式返回
 - 外部扩展：远程 MCP、GrokSearch 风格聚合搜索上游配置
 
 ## 环境要求
