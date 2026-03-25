@@ -319,6 +319,10 @@ export function getRunFailureHint(errorSummary: string | null | undefined, error
     return "当前是上游网关超时。平台已适度放宽等待时间，但如果你使用的是第三方 OpenAI 兼容网关，且接口模式为 Responses API，建议先切到 Chat Completions API；同时减少 MCP / 外部事实 / 上下文体量，或检查上游代理超时配置后再重试。";
   }
 
+  if (code === "CANCELED" || normalized.includes("aborted before completion") || normalized.includes("stream was aborted")) {
+    return "当前是流式生成在完成前被中断。常见原因有 3 类：浏览器页面在生成中刷新/切页、反向代理读超时、或平台任务等待预算耗尽。如果你使用的是第三方 OpenAI 兼容网关，且接口模式为 Responses API，建议先切到 Chat Completions API；同时可减少上下文体量后再试。";
+  }
+
   if (code === "MODEL_UNAVAILABLE" || normalized.includes("model")) {
     return "先在设置页执行模型接口健康检查，确认 baseURL、模型名和服务可达性。";
   }
