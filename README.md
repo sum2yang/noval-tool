@@ -21,11 +21,13 @@
 - AI 引导模式支持“先选模型接口动态逐问”与“无接口回退本地问卷”双路径
 - 作者自带资料上传
 - 资料区支持批量上传作者材料
+- 空白创建上传作者材料后，会沿用资料区同一批量导入链路再执行初始化整理
 - `ingest_sources` 资料吸收与结构化整理
 - `generate_setting` / `generate_outline` / `generate_chapter`
 - `review_content` / `minimal_fix` / `sync_state`
 - Draft / accept / revision 闭环
 - 章节编辑、自动保存、审稿定位
+- 项目文件上下文在超长时会自动按文件与标题分段压缩，避免勾选过多文件导致模型请求失败
 - 项目级 API 预设（支持新增 / 删除 / 排序）
 - OpenAI 端点支持 `Responses API` / `Chat Completions API` 显式切换
 - OpenAI `Responses API` 在任务执行与 AI 引导创建里支持流式返回
@@ -128,6 +130,56 @@ npm run prisma:migrate
 npm run dev
 ```
 
+说明：
+
+- `npm run dev` 只用于本地开发调试，不要把它直接暴露给公网用户
+- 如果你通过 Cloudflare、Nginx、面板反代、内网穿透或自定义域名把开发服务器公开出去，容易出现 HMR / Server Action / 登录按钮失效等问题
+- 本地开发建议直接访问 `http://localhost:3000`
+
+### 方式二：Node.js 生产启动
+
+如果你不使用 Docker，而是直接在服务器上用 Node.js 跑正式环境，请使用生产模式，而不是 `npm run dev`。
+
+1. 安装依赖
+
+```bash
+npm install --legacy-peer-deps
+```
+
+2. 准备 `.env`
+
+- `DATABASE_URL`
+- `BETTER_AUTH_SECRET`
+- `BETTER_AUTH_URL`
+- `APP_BASE_URL`
+- `ENCRYPTION_KEY`
+
+其中：
+
+- `BETTER_AUTH_URL` 和 `APP_BASE_URL` 必须填写实际对外访问地址，例如 `https://your-domain.com`
+- `BETTER_AUTH_SECRET` 应至少使用 32 位以上随机字符串
+- `ENCRYPTION_KEY` 应使用足够长的随机密钥
+
+3. 生成 Prisma Client 并执行生产迁移
+
+```bash
+npx prisma generate
+npm run prisma:deploy
+```
+
+4. 构建并启动生产服务
+
+```bash
+npm run build
+npm run start
+```
+
+说明：
+
+- 正式环境请使用 `npm run build && npm run start`，不要使用 `npm run dev`
+- 如果前面有 Nginx / Caddy / Cloudflare，请把它们反代到 `next start` 或 Docker 容器，而不是反代到 `next dev`
+- 如果你需要长期稳定运行，优先推荐下面的 Docker / GHCR / Compose 方式
+
 ## Docker 启动
 
 推荐本地直接使用 Docker 跑完整环境，后续上服务器也可以沿用同一套结构。
@@ -214,6 +266,7 @@ cd novel-tool
 
 - `npm run dev`
 - `npm run build`
+- `npm run start`
 - `npm run lint`
 - `npm run typecheck`
 - `npm run test`
@@ -330,5 +383,6 @@ GitHub Actions 会把这些内容回传到 Step Summary，并上传完整诊断 
 
 ## 致谢
 
+- **社区交流与方法分享** — 感谢 [Linux DO 社区](https://linux.do)，为本项目的写作工作流、工具组合与实践讨论提供了持续参考
 - **原创文本与创作思路** — [宁河图](https://linux.do/u/user2609/summary)，本项目的创作方法论、Prompt 设计与题材模板主要源自其实战经验分享
 - **GrokSearch 工程启发** — 感谢孙老师的 [GrokSearch](https://github.com/GuDaStudio/GrokSearch)，为本项目的 Grok / Tavily / Firecrawl 聚合搜索接入提供了重要参考

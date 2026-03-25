@@ -445,7 +445,10 @@ export async function POST(
     const projectSkillOverlay =
       projectOverlayArtifacts.find((artifact) => artifact.artifactKey === "project_skill_pack")?.currentRevision?.content ??
       "";
-    const resolvedArtifactsForRun = appendUniqueArtifacts([...artifacts, ...projectOverlayArtifacts]);
+    const contextArtifacts = artifacts.filter(
+      (artifact) => artifact.artifactKey !== "project_prompt_pack" && artifact.artifactKey !== "project_skill_pack",
+    );
+    const resolvedArtifactsForRun = appendUniqueArtifacts([...contextArtifacts, ...projectOverlayArtifacts]);
 
     const references = payload.selectedReferenceIds.length
       ? await prisma.referenceDocument.findMany({
@@ -466,7 +469,7 @@ export async function POST(
           orderBy: { name: "asc" },
         })
       : [];
-    const chapterArtifactIds = artifacts
+    const chapterArtifactIds = contextArtifacts
       .filter((artifact) => artifact.kind === "project_chapter")
       .map((artifact) => artifact.id);
     const autosaveDrafts = chapterArtifactIds.length
@@ -496,7 +499,7 @@ export async function POST(
       ([, overlay]) => overlay,
     );
 
-    const projectContext = buildProjectContext(artifacts, latestAutosaveDrafts);
+    const projectContext = buildProjectContext(contextArtifacts, latestAutosaveDrafts);
     const selectedReferences = buildSelectedReferences(references);
     const selectedMcpTools =
       mcpServers.length > 0

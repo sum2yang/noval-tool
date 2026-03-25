@@ -16,6 +16,7 @@ import {
   type BlankGapQuestion,
 } from "@/lib/projects/blank-onboarding";
 import type { OnboardingSessionPayload } from "@/lib/projects/onboarding";
+import { parseUploadedReferenceSummaries } from "@/lib/references/upload-response";
 
 type ProviderEndpointOption = {
   id: string;
@@ -495,27 +496,22 @@ export function NewProjectCreator({
   }
 
   async function uploadBlankMaterials(projectId: string) {
-    const uploadedReferences: BlankPreparationResult["importedReferences"] = [];
+    const formData = new FormData();
 
     for (const file of blankFiles) {
-      const formData = new FormData();
-      formData.append("file", file);
-      if (blankForm.tags.trim()) {
-        formData.append("tags", blankForm.tags.trim());
-      }
-
-      const payload = await requestJson<{ id: string; filename: string }>(`/api/projects/${projectId}/references`, {
-        method: "POST",
-        body: formData,
-      });
-
-      uploadedReferences.push({
-        id: payload.id,
-        filename: payload.filename,
-      });
+      formData.append("files", file);
     }
 
-    return uploadedReferences;
+    if (blankForm.tags.trim()) {
+      formData.append("tags", blankForm.tags.trim());
+    }
+
+    const payload = await requestJson<unknown>(`/api/projects/${projectId}/references`, {
+      method: "POST",
+      body: formData,
+    });
+
+    return parseUploadedReferenceSummaries(payload);
   }
 
   async function finalizeBlankOnboarding(params: {

@@ -120,6 +120,133 @@ describe("generation context helpers", () => {
     expect(references).toContain("# harbor.txt\n港口秋季船期更密。");
   });
 
+  it("compresses oversized project context by segments to keep generation requests stable", async () => {
+    const { buildProjectContext } = await import("./context");
+
+    const oversized = [
+      "# 世界框架",
+      "设定".repeat(1600),
+      "",
+      "## 势力关系",
+      "博弈".repeat(1600),
+      "",
+      "## 当前任务",
+      "推进".repeat(1600),
+    ].join("\n");
+    const context = buildProjectContext([
+      {
+        id: "artifact-1",
+        projectId: "project-1",
+        artifactKey: "world_bible",
+        filename: "world_bible.md",
+        kind: "project_setting",
+        currentRevisionId: "rev-1",
+        createdAt: new Date("2026-03-20T00:00:00.000Z"),
+        updatedAt: new Date("2026-03-20T00:00:00.000Z"),
+        currentRevision: {
+          id: "rev-1",
+          artifactId: "artifact-1",
+          content: oversized,
+          summary: "seed",
+          sourceDraftId: null,
+          sourceRunId: null,
+          acceptedByUserId: null,
+          createdAt: new Date("2026-03-20T00:00:00.000Z"),
+        },
+      },
+      {
+        id: "artifact-2",
+        projectId: "project-1",
+        artifactKey: "task_plan",
+        filename: "task_plan.md",
+        kind: "project_setting",
+        currentRevisionId: "rev-2",
+        createdAt: new Date("2026-03-20T00:00:00.000Z"),
+        updatedAt: new Date("2026-03-20T00:00:00.000Z"),
+        currentRevision: {
+          id: "rev-2",
+          artifactId: "artifact-2",
+          content: oversized,
+          summary: "seed",
+          sourceDraftId: null,
+          sourceRunId: null,
+          acceptedByUserId: null,
+          createdAt: new Date("2026-03-20T00:00:00.000Z"),
+        },
+      },
+      {
+        id: "artifact-3",
+        projectId: "project-1",
+        artifactKey: "findings",
+        filename: "findings.md",
+        kind: "project_setting",
+        currentRevisionId: "rev-3",
+        createdAt: new Date("2026-03-20T00:00:00.000Z"),
+        updatedAt: new Date("2026-03-20T00:00:00.000Z"),
+        currentRevision: {
+          id: "rev-3",
+          artifactId: "artifact-3",
+          content: oversized,
+          summary: "seed",
+          sourceDraftId: null,
+          sourceRunId: null,
+          acceptedByUserId: null,
+          createdAt: new Date("2026-03-20T00:00:00.000Z"),
+        },
+      },
+    ] as never);
+
+    expect(context).toContain("# world_bible.md");
+    expect(context).toContain("# task_plan.md");
+    expect(context).toContain("# findings.md");
+    expect(context).toContain("[已分段压缩，保留结构锚点与段首摘要，完整正文请回到项目文件查看]");
+    expect(context).toContain("## 势力关系");
+    expect(context.length).toBeLessThan(19000);
+  });
+
+  it("does not nest compression notices when the remaining total budget becomes smaller", async () => {
+    const { buildProjectContext } = await import("./context");
+
+    const oversized = [
+      "# 世界框架",
+      "设定".repeat(1600),
+      "",
+      "## 势力关系",
+      "博弈".repeat(1600),
+      "",
+      "## 当前任务",
+      "推进".repeat(1600),
+    ].join("\n");
+    const artifacts = Array.from({ length: 5 }, (_, index) => ({
+      id: `artifact-${index + 1}`,
+      projectId: "project-1",
+      artifactKey: `artifact_key_${index + 1}`,
+      filename: `artifact_${index + 1}.md`,
+      kind: "project_setting",
+      currentRevisionId: `rev-${index + 1}`,
+      createdAt: new Date("2026-03-20T00:00:00.000Z"),
+      updatedAt: new Date("2026-03-20T00:00:00.000Z"),
+      currentRevision: {
+        id: `rev-${index + 1}`,
+        artifactId: `artifact-${index + 1}`,
+        content: oversized,
+        summary: "seed",
+        sourceDraftId: null,
+        sourceRunId: null,
+        acceptedByUserId: null,
+        createdAt: new Date("2026-03-20T00:00:00.000Z"),
+      },
+    }));
+
+    const context = buildProjectContext(artifacts as never);
+    const compressionNoticeCount = Array.from(
+      context.matchAll(/\[已分段压缩，保留结构锚点与段首摘要，完整正文请回到项目文件查看\]/g),
+    ).length;
+
+    expect(compressionNoticeCount).toBeLessThanOrEqual(4);
+    expect(context).toContain("# artifact_4.md");
+  });
+
   it('returns "无" when no references are selected', async () => {
     const { buildSelectedReferences } = await import("./context");
 
