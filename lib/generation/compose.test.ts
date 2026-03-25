@@ -8,6 +8,7 @@ describe("generation compose helpers", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.resetModules();
     vi.doUnmock("@/lib/knowledge");
   });
@@ -64,8 +65,8 @@ describe("generation compose helpers", () => {
   });
 
   it("falls back to the configured fallback prompt when the primary prompt file is missing", async () => {
-    vi.doMock("@/lib/knowledge", () => ({
-      loadKnowledgeBase: vi.fn().mockResolvedValue({
+    const knowledgeModule = await import("@/lib/knowledge");
+    vi.spyOn(knowledgeModule, "loadKnowledgeBase").mockResolvedValue({
         canonical: {},
         prompts: {
           "fallback.md": "Fallback prompt: {{user_instruction}}",
@@ -101,9 +102,8 @@ describe("generation compose helpers", () => {
             },
           ],
         },
-      }),
-      getKnowledgeDigest: vi.fn().mockResolvedValue("digest"),
-    }));
+      });
+    vi.spyOn(knowledgeModule, "getKnowledgeDigest").mockResolvedValue("digest");
 
     const { composeResolvedPrompt } = await import("./compose");
     const result = await composeResolvedPrompt({
