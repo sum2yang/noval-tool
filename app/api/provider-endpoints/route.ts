@@ -9,7 +9,10 @@ export async function GET(request: Request) {
   try {
     const user = await resolveRequestUser(request);
     const endpoints = await prisma.providerEndpoint.findMany({
-      where: { userId: user.id },
+      where: {
+        userId: user.id,
+        archivedAt: null,
+      },
       orderBy: { updatedAt: "desc" },
       select: {
         id: true,

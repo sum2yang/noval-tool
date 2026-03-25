@@ -340,6 +340,7 @@ export async function POST(
       where: {
         id: payload.endpointId,
         userId: user.id,
+        archivedAt: null,
       },
     });
 

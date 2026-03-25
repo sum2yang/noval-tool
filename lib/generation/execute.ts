@@ -8,7 +8,7 @@ import { createRemoteMcpClient } from "@/lib/mcp/client";
 import { toPrismaJson } from "@/lib/prisma-json";
 import { createLanguageModel } from "@/lib/providers/factory";
 
-const GENERATION_REQUEST_TIMEOUT_MS = 180000;
+const GENERATION_REQUEST_TIMEOUT_MS = 300000;
 
 type McpClient = Awaited<ReturnType<typeof createRemoteMcpClient>>;
 
@@ -252,6 +252,7 @@ export async function executeGeneration(input: GenerationExecutionInput): Promis
       prompt: input.prompt,
       temperature: input.temperature,
       maxOutputTokens: input.maxOutputTokens,
+      maxRetries: 0,
       timeout: {
         totalMs: GENERATION_REQUEST_TIMEOUT_MS,
       },
@@ -355,8 +356,8 @@ export async function executeGenerationStream(
       });
     },
     onAbort: async () => {
-      rejectFinishMetadata(new ApiError(499, "CANCELED", "The generation stream was aborted."));
-      await rejectCompleted(new ApiError(499, "CANCELED", "The generation stream was aborted."));
+      rejectFinishMetadata(new ApiError(499, "CANCELED", "The generation stream was aborted before completion."));
+      await rejectCompleted(new ApiError(499, "CANCELED", "The generation stream was aborted before completion."));
     },
     onError: async ({ error }) => {
       rejectFinishMetadata(error);

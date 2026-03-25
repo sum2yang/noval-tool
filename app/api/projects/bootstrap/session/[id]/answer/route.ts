@@ -160,6 +160,7 @@ export async function POST(
             where: {
               id: summary.runtime.endpointId,
               userId: user.id,
+              archivedAt: null,
             },
           });
 

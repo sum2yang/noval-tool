@@ -15,7 +15,10 @@ export default async function SettingsPage() {
 
   const [endpoints, mcpServers] = await Promise.all([
     prisma.providerEndpoint.findMany({
-      where: { userId: user.id },
+      where: {
+        userId: user.id,
+        archivedAt: null,
+      },
       orderBy: { updatedAt: "desc" },
       select: {
         id: true,

@@ -31,7 +31,7 @@
 - OpenAI `Responses API` 在任务执行与 AI 引导创建里支持流式返回
 - 远程 MCP 接入
 - 用户级 Grok / Tavily / Firecrawl 配置
-- 设置页支持删除未绑定历史生成记录的模型接口与远程 MCP 服务
+- 设置页支持移除模型接口与远程 MCP 服务；若模型接口已被历史运行引用，则自动归档并从可用列表隐藏
 - 导出中心与服务端归档
 - Docker 本地联调
 - GitHub Actions + GHCR + 远端 Docker Compose 部署
@@ -59,7 +59,9 @@
 - 先选择模型接口与模型名时，会由模型根据题材生成首问，并在每次回答后动态决定下一问和推荐选项
 - 当所选 OpenAI 端点使用 `Responses API` 时，首问与后续追问会实时流式返回到页面
 - 没有选择模型接口时，会自动回退到当前内置本地问卷，不会阻塞项目初始化
+- 流式返回是显式协商能力：前端会带 `Accept: application/x-ndjson, application/json` 请求实时结果；脚本、CI 和默认调用方仍走 JSON 返回，避免破坏既有 smoke / release 合同
 - 模型接口健康检查只验证“默认模型的最小探活请求”；如果正式生成携带大上下文、不同模型名或上游网关限制不同，仍可能在生成阶段失败
+- 平台已适度放宽任务生成等待预算；如果第三方 OpenAI 兼容网关在 `Responses API` 下仍容易出现流式中断或超时，建议优先切到 `Chat Completions API`
 
 ## 运行架构
 
@@ -168,7 +170,7 @@ cp .env.docker.example .env.docker
 - 本地 Compose 环境里 `DATABASE_URL` 默认应保持连接容器内主机名 `postgres`
 - `APP_IMAGE` 本地开发时通常留空
 - 如果你通过域名或反向代理访问站点，`BETTER_AUTH_URL` 和 `APP_BASE_URL` 必须改成实际对外访问地址；否则 Better Auth 会报 `Invalid origin`，导致注册、登录和退出登录失败
-- 如果某个 OpenAI 兼容上游只实现了 `/v1/chat/completions`，请在设置页把该端点的 API 模式切到 `Chat Completions API`
+- 如果某个 OpenAI 兼容上游只实现了 `/v1/chat/completions`，或它对 `/v1/responses` 容易返回 `Gateway Timeout`，请在设置页把该端点的 API 模式切到 `Chat Completions API`
 - 当用户没有填写个人 Grok / Tavily / Firecrawl 配置时，应用会按这 7 个字段逐项回退到平台默认
 - 如果同时填写 `LINUX_DO_CLIENT_ID` 和 `LINUX_DO_CLIENT_SECRET`，登录页和注册页会自动显示 `Linux DO` 登录 / 注册按钮
 
@@ -184,16 +186,27 @@ docker compose --env-file .env.docker up --build
 docker compose --env-file .env.docker down
 ```
 
-低配置机器说明：
+### 低配服务器分支
 
-- 如果你的机器只有 `2C2G`，不要在服务器上执行 `docker compose up --build`
-- 这种规格本地构建镜像很容易因为 Node/Next build、Prisma 和多容器同时抢内存而表现为“卡死”或被系统杀掉
-- 生产环境应优先使用 GitHub Actions 构建好的 GHCR 镜像，再在服务器执行 `docker compose pull && docker compose up -d --no-build`
-- 当前默认已经加了更保守的低内存参数：
-  - `NODE_OPTIONS=--max-old-space-size=768`
-  - `MALLOC_ARENA_MAX=2`
-  - PostgreSQL 使用较保守的 shared buffers / work mem / max connections
-- 如果你仍然把 `postgres + minio + app` 全部放在同一台 `2C2G` 机器上，建议额外开启 swap，或者把对象存储/数据库外置
+如果你的服务器规格只有 `2C2G` 或更低，建议直接使用低配部署分支，而不是在主分支上本机 `build`：
+
+```bash
+git clone -b chore/low-spec-deploy-tuning https://github.com/sum2yang/novel-tool.git
+cd novel-tool
+```
+
+这个分支已经合入当前主分支功能，同时额外带了更保守的部署调优：
+
+- `app` 容器默认注入 `NODE_OPTIONS=--max-old-space-size=768`
+- `app` 容器默认注入 `MALLOC_ARENA_MAX=2`
+- `postgres` 默认使用更低的 `shared_buffers / work_mem / max_connections`
+- `docker-entrypoint.sh` 直接调用本地 Prisma / Next 可执行文件，减少 `npx` 带来的额外启动开销
+
+低配机器建议：
+
+- 不要在服务器上执行 `docker compose up --build`
+- 优先让 GitHub Actions 构建 GHCR 镜像，再在服务器执行 `docker compose pull && docker compose up -d --no-build`
+- 如果 `postgres + minio + app` 全部放在同一台低配机器，建议额外开启 swap，或者把对象存储 / 数据库外置
 
 ## 常用脚本
 
@@ -277,6 +290,12 @@ docker compose --env-file .env.docker down
 7. 在服务器执行 `docker compose pull app && docker compose up -d --no-build`
 8. 对 `/api/health` 和 `/login` 执行 smoke
 9. 如果失败，自动回滚到上一版环境文件、上一版 commit 和上一版镜像
+
+分支选择建议：
+
+- 常规服务器使用 `main`
+- 低内存服务器优先使用 `chore/low-spec-deploy-tuning`
+- 两个分支都保持同一功能线，低配分支只额外携带部署参数与启动开销优化
 
 ## 远端部署报告
 

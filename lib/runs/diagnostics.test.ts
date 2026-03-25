@@ -74,6 +74,7 @@ describe("run diagnostics helpers", () => {
     expect(getGrokConfigSourceLabel("env")).toBe("平台默认");
     expect(getRunFailureHint("MCP tool loading failed.", null)).toContain("MCP");
     expect(getRunFailureHint("Failed after 3 attempts. Last error: Gateway Timeout", "TIMEOUT")).toContain("上游网关超时");
+    expect(getRunFailureHint("The generation stream was aborted before completion.", "CANCELED")).toContain("流式生成在完成前被中断");
     expect(
       buildOperatorErrorMessage({
         error: {

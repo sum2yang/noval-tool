@@ -71,6 +71,7 @@ export async function PATCH(
         where: {
           id: payload.defaultEndpointId,
           userId: user.id,
+          archivedAt: null,
         },
         select: { id: true },
       });
@@ -103,6 +104,7 @@ export async function PATCH(
           where: {
             id: endpointId!,
             userId: user.id,
+            archivedAt: null,
           },
           select: { id: true },
         });

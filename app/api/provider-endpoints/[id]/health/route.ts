@@ -13,6 +13,7 @@ export async function POST(
       where: {
         id,
         userId: user.id,
+        archivedAt: null,
       },
     });
 

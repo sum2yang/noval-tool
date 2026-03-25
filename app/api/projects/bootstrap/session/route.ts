@@ -73,6 +73,7 @@ export async function POST(request: Request) {
         where: {
           id: payload.endpointId,
           userId: user.id,
+          archivedAt: null,
         },
       });
 

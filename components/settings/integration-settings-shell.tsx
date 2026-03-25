@@ -420,7 +420,12 @@ export function IntegrationSettingsShell({
                           if (!response.ok) {
                             throw new Error(await readErrorMessage(response));
                           }
-                          setEndpointMessage(`已删除模型接口 ${endpoint.label}。`);
+                          const payload = (await response.json().catch(() => null)) as { archived?: boolean } | null;
+                          setEndpointMessage(
+                            payload?.archived
+                              ? `已移除模型接口 ${endpoint.label}。历史运行仍会保留，当前接口已从可用列表隐藏。`
+                              : `已删除模型接口 ${endpoint.label}。`,
+                          );
                         });
                       }}
                     >

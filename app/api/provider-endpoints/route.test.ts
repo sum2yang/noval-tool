@@ -67,6 +67,16 @@ describe("provider endpoint collection route", () => {
     const payload = await response.json();
 
     expect(response.status).toBe(200);
+    expect(prismaMock.providerEndpoint.findMany).toHaveBeenCalledWith({
+      where: {
+        userId: "user-1",
+        archivedAt: null,
+      },
+      orderBy: { updatedAt: "desc" },
+      select: expect.objectContaining({
+        openaiApiStyle: true,
+      }),
+    });
     expect(payload.items[0].openaiApiStyle).toBe("chat_completions");
   });
 

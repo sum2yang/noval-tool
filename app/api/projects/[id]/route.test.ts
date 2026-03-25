@@ -139,6 +139,7 @@ describe("project route", () => {
       where: {
         id: "endpoint-1",
         userId: "user-1",
+        archivedAt: null,
       },
       select: { id: true },
     });

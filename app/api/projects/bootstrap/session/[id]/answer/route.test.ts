@@ -254,6 +254,7 @@ describe("project onboarding answer route", () => {
       where: {
         id: "endpoint-1",
         userId: "user-1",
+        archivedAt: null,
       },
     });
     expect(planAiOnboardingQuestionMock).toHaveBeenCalled();

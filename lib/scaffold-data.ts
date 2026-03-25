@@ -77,7 +77,10 @@ export async function getWorkbenchSnapshot(projectId: string, userId: string) {
       );
       const [providerEndpoints, mcpServers, drafts, editorAutosaveDraft, runs] = await Promise.all([
         prisma.providerEndpoint.findMany({
-          where: { userId },
+          where: {
+            userId,
+            archivedAt: null,
+          },
           orderBy: [{ updatedAt: "desc" }],
           select: {
             id: true,

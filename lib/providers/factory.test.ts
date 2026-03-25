@@ -89,6 +89,7 @@ describe("provider endpoint probe", () => {
         defaultModel: "gpt-5",
         healthStatus: "misconfigured",
         lastHealthCheckAt: null,
+        archivedAt: null,
         createdAt: new Date("2026-03-20T00:00:00.000Z"),
         updatedAt: new Date("2026-03-20T00:00:00.000Z"),
       },
@@ -119,6 +120,7 @@ describe("provider endpoint probe", () => {
         defaultModel: "gpt-4o",
         healthStatus: "misconfigured",
         lastHealthCheckAt: null,
+        archivedAt: null,
         createdAt: new Date("2026-03-20T00:00:00.000Z"),
         updatedAt: new Date("2026-03-20T00:00:00.000Z"),
       },
@@ -152,6 +154,7 @@ describe("provider endpoint probe", () => {
       defaultModel: "gpt-test",
       healthStatus: "misconfigured",
       lastHealthCheckAt: null,
+      archivedAt: null,
       createdAt: new Date("2026-03-20T00:00:00.000Z"),
       updatedAt: new Date("2026-03-20T00:00:00.000Z"),
     });
@@ -187,6 +190,7 @@ describe("provider endpoint probe", () => {
       defaultModel: "claude-test",
       healthStatus: "misconfigured",
       lastHealthCheckAt: null,
+      archivedAt: null,
       createdAt: new Date("2026-03-20T00:00:00.000Z"),
       updatedAt: new Date("2026-03-20T00:00:00.000Z"),
     });
@@ -214,6 +218,7 @@ describe("provider endpoint probe", () => {
       defaultModel: "gemini-test",
       healthStatus: "misconfigured",
       lastHealthCheckAt: null,
+      archivedAt: null,
       createdAt: new Date("2026-03-20T00:00:00.000Z"),
       updatedAt: new Date("2026-03-20T00:00:00.000Z"),
     });
@@ -241,6 +246,7 @@ describe("provider endpoint probe", () => {
       defaultModel: "missing-model",
       healthStatus: "misconfigured",
       lastHealthCheckAt: null,
+      archivedAt: null,
       createdAt: new Date("2026-03-20T00:00:00.000Z"),
       updatedAt: new Date("2026-03-20T00:00:00.000Z"),
     });
