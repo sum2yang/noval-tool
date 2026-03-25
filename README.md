@@ -27,7 +27,7 @@
 - `review_content` / `minimal_fix` / `sync_state`
 - Draft / accept / revision 闭环
 - 章节编辑、自动保存、审稿定位
-- 项目文件上下文在超长时会自动截断，避免勾选过多文件导致模型请求失败
+- 项目文件上下文在超长时会自动按文件与标题分段压缩，避免勾选过多文件导致模型请求失败
 - 项目级 API 预设（支持新增 / 删除 / 排序）
 - OpenAI 端点支持 `Responses API` / `Chat Completions API` 显式切换
 - OpenAI `Responses API` 在任务执行与 AI 引导创建里支持流式返回
